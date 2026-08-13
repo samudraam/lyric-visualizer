@@ -1,10 +1,10 @@
 @import "tailwindcss";
 @import url('https://fonts.googleapis.com/css2?family=Fraunces:wght@600;700&family=JetBrains+Mono:wght@400;500&display=swap');
 
-@theme {
+:root {
   --color-bg: #000000;
-  --color-panel: #A9A9A9;
-  --color-panel-2: #808080;
+  --color-panel: #333333;
+  --color-panel-2: #696969;
   --color-text: #f5ede4;
   --color-text-dim: #b8a9bc;
   --color-accent: #f2a93b;
