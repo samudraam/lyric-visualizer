@@ -1,7 +1,7 @@
 import { useRef, useState, useEffect } from 'react';
-import { Play, Pause, Upload, Plus, Box, RotateCcw, Type, ExternalLink } from 'lucide-react';
+import { Play, Pause, Upload, Plus, Box, RotateCcw, Type, ExternalLink, Settings } from 'lucide-react';
 import Stage from './Stage.jsx';
-import { FLORAL_PALETTE } from './lib/palette.js';
+import { FLORAL_PALETTE, DEFAULT_STAGE_COLORS, DEFAULT_LYRIC_COLOR } from './lib/palette.js';
 import { loadCustomFont, CUSTOM_FONT_FAMILY } from './lib/font.js';
 import { STAGE_CHANNEL_NAME } from './lib/stageChannel.js';
 
@@ -71,6 +71,11 @@ export default function LyricBloom() {
   const [fontError, setFontError] = useState('');
   const [fontLoaded, setFontLoaded] = useState(false); // whether the uploaded font has finished loading in THIS document
 
+  const [showSettings, setShowSettings] = useState(false); // palette/stage-color/font settings menu
+  const [palette, setPalette] = useState(FLORAL_PALETTE);       // lyric-block + particle colors, editable in settings
+  const [stageColors, setStageColors] = useState(DEFAULT_STAGE_COLORS); // Stage's background gradient stops
+  const [lyricColor, setLyricColor] = useState(DEFAULT_LYRIC_COLOR); // active-lyric text color on Stage
+
   /* =======================================================================
      REFS
      -----------------------------------------------------------------------
@@ -129,6 +134,9 @@ export default function LyricBloom() {
   const channelRef = useRef(null);
   const glbBufferRef = useRef(null);
   const fontBufferRef = useRef(null);
+  const paletteRef = useRef(palette);
+  const stageColorsRef = useRef(stageColors);
+  const lyricColorRef = useRef(lyricColor);
 
   useEffect(() => {
     const channel = new BroadcastChannel(STAGE_CHANNEL_NAME);
@@ -141,6 +149,9 @@ export default function LyricBloom() {
       channel.postMessage({ type: 'lyrics', placedBlocks: placedBlocksRef.current });
       if (glbBufferRef.current) channel.postMessage({ type: 'shape', buffer: glbBufferRef.current });
       if (fontBufferRef.current) channel.postMessage({ type: 'font', buffer: fontBufferRef.current });
+      channel.postMessage({ type: 'palette', palette: paletteRef.current });
+      channel.postMessage({ type: 'stageColors', stageColors: stageColorsRef.current });
+      channel.postMessage({ type: 'lyricColor', lyricColor: lyricColorRef.current });
     };
 
     return () => channel.close();
@@ -159,6 +170,21 @@ export default function LyricBloom() {
   useEffect(() => {
     channelRef.current?.postMessage({ type: 'lyrics', placedBlocks });
   }, [placedBlocks]);
+
+  useEffect(() => {
+    paletteRef.current = palette;
+    channelRef.current?.postMessage({ type: 'palette', palette });
+  }, [palette]);
+
+  useEffect(() => {
+    stageColorsRef.current = stageColors;
+    channelRef.current?.postMessage({ type: 'stageColors', stageColors });
+  }, [stageColors]);
+
+  useEffect(() => {
+    lyricColorRef.current = lyricColor;
+    channelRef.current?.postMessage({ type: 'lyricColor', lyricColor });
+  }, [lyricColor]);
 
   /* =======================================================================
      AUDIO-SYNC LOOP — runs exactly once (empty dependency array)
@@ -329,6 +355,23 @@ export default function LyricBloom() {
     setFontLoaded(false);
   };
 
+  /* =======================================================================
+     SETTINGS MENU — palette, stage background colors, lyric text color
+     ======================================================================= */
+  const handlePaletteColorChange = (index, value) => {
+    setPalette((prev) => prev.map((c, i) => (i === index ? value : c)));
+  };
+
+  const handleResetPalette = () => setPalette(FLORAL_PALETTE);
+
+  const handleStageColorChange = (key, value) => {
+    setStageColors((prev) => ({ ...prev, [key]: value }));
+  };
+
+  const handleResetStageColors = () => setStageColors(DEFAULT_STAGE_COLORS);
+
+  const handleResetLyricColor = () => setLyricColor(DEFAULT_LYRIC_COLOR);
+
   // Opens the visualizer-only pop-out. A named window target means clicking
   // this again re-focuses the same tab instead of spawning duplicates.
   const openStagePopout = () => {
@@ -376,7 +419,7 @@ export default function LyricBloom() {
     const rect = trackRef.current.getBoundingClientRect();
     const offsetX = e.clientX - rect.left + trackRef.current.scrollLeft;
     const start = clamp(xToTime(offsetX), 0, Math.max(0, audioDuration - 2));
-    const color = FLORAL_PALETTE[placedBlocks.length % FLORAL_PALETTE.length];
+    const color = palette[placedBlocks.length % palette.length];
 
     setPlacedBlocks((prev) => [...prev, { id: item.id, text: item.text, start, duration: 2, color }]);
     setLyricBank((prev) => prev.filter((b) => b.id !== item.id));
@@ -428,6 +471,33 @@ export default function LyricBloom() {
       const newDuration = clamp(startDuration + deltaTime, 0.3, Math.max(0.3, audioDuration - block.start));
       setPlacedBlocks((prev) => prev.map((b) => (b.id === block.id ? { ...b, duration: newDuration } : b)));
     };
+    const onUp = () => {
+      document.removeEventListener('pointermove', onMove);
+      document.removeEventListener('pointerup', onUp);
+    };
+    document.addEventListener('pointermove', onMove);
+    document.addEventListener('pointerup', onUp);
+  };
+
+  /* =======================================================================
+     SCRUB THE RULER TO SEEK
+     -----------------------------------------------------------------------
+     Same document-level pointerdown/move/up pattern as the block drag/resize
+     handlers above. Just writes audio.currentTime directly — the audio-sync
+     loop already reads it every frame, so the playhead and time readout
+     catch up on the very next frame with no extra state needed here.
+     ======================================================================= */
+  const seekToClientX = (clientX) => {
+    if (!audioRef.current || !audioURL) return;
+    const rect = trackRef.current.getBoundingClientRect();
+    const time = clamp(xToTime(clientX - rect.left), 0, audioDuration);
+    audioRef.current.currentTime = time;
+  };
+
+  const handleRulerPointerDown = (e) => {
+    if (!audioURL) return;
+    seekToClientX(e.clientX);
+    const onMove = (ev) => seekToClientX(ev.clientX);
     const onUp = () => {
       document.removeEventListener('pointermove', onMove);
       document.removeEventListener('pointerup', onUp);
@@ -496,28 +566,6 @@ export default function LyricBloom() {
               <RotateCcw size={16} />
             </button>
           )}
-          <label
-            className={`${BTN_BASE} bg-panel-2 hover:bg-[#2E2136]`}
-            title="Use an uploaded font for the lyric text"
-          >
-            <Type size={16} />
-            <span>{fontName || 'Upload font'}</span>
-            <input
-              type="file"
-              accept=".woff2,.woff,.ttf,.otf"
-              onChange={handleFontFile}
-              className="hidden"
-            />
-          </label>
-          {fontName && (
-            <button
-              className={`${BTN_BASE} bg-panel-2 hover:bg-[#2E2136]`}
-              onClick={handleResetFont}
-              title="Reset to default font"
-            >
-              <RotateCcw size={16} />
-            </button>
-          )}
           <button
             className={`${BTN_BASE} bg-panel-2 hover:bg-[#2E2136]`}
             onClick={openStagePopout}
@@ -526,9 +574,133 @@ export default function LyricBloom() {
             <ExternalLink size={16} />
             <span>Pop out</span>
           </button>
+          <div className="relative">
+            <button
+              className={`${BTN_BASE} bg-panel-2 hover:bg-[#2E2136]`}
+              onClick={() => setShowSettings((v) => !v)}
+              title="Adjust palette, stage colors, and lyric font"
+              aria-expanded={showSettings}
+            >
+              <Settings size={16} />
+              <span>Settings</span>
+            </button>
+            {showSettings && (
+              <>
+                <div className="fixed inset-0 z-40" onClick={() => setShowSettings(false)} />
+                <div className="absolute right-0 top-full mt-2 z-50 w-72 bg-panel border border-white/10 rounded-xl p-4 shadow-[0_8px_30px_rgba(0,0,0,0.5)] flex flex-col gap-4 text-left">
+                  <div>
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="text-[11px] font-semibold text-text-dim uppercase tracking-wide">Palette</span>
+                      <button
+                        className="text-[11px] text-text-dim hover:text-text hover:underline underline-offset-2 cursor-pointer"
+                        onClick={handleResetPalette}
+                      >
+                        Reset
+                      </button>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      {palette.map((color, i) => (
+                        <input
+                          key={i}
+                          type="color"
+                          value={color}
+                          onChange={(e) => handlePaletteColorChange(i, e.target.value)}
+                          className="w-8 h-8 rounded-md border border-white/10 bg-transparent p-0 cursor-pointer"
+                          title={`Palette color ${i + 1}`}
+                        />
+                      ))}
+                    </div>
+                  </div>
+
+                  <div>
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="text-[11px] font-semibold text-text-dim uppercase tracking-wide">Stage colors</span>
+                      <button
+                        className="text-[11px] text-text-dim hover:text-text hover:underline underline-offset-2 cursor-pointer"
+                        onClick={handleResetStageColors}
+                      >
+                        Reset
+                      </button>
+                    </div>
+                    <div className="flex items-center gap-4">
+                      <label className="flex items-center gap-2 text-xs cursor-pointer">
+                        <input
+                          type="color"
+                          value={stageColors.inner}
+                          onChange={(e) => handleStageColorChange('inner', e.target.value)}
+                          className="w-8 h-8 rounded-md border border-white/10 bg-transparent p-0 cursor-pointer"
+                        />
+                        Inner
+                      </label>
+                      <label className="flex items-center gap-2 text-xs cursor-pointer">
+                        <input
+                          type="color"
+                          value={stageColors.outer}
+                          onChange={(e) => handleStageColorChange('outer', e.target.value)}
+                          className="w-8 h-8 rounded-md border border-white/10 bg-transparent p-0 cursor-pointer"
+                        />
+                        Outer
+                      </label>
+                    </div>
+                  </div>
+
+                  <div>
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="text-[11px] font-semibold text-text-dim uppercase tracking-wide">Font color</span>
+                      <button
+                        className="text-[11px] text-text-dim hover:text-text hover:underline underline-offset-2 cursor-pointer"
+                        onClick={handleResetLyricColor}
+                      >
+                        Reset
+                      </button>
+                    </div>
+                    <label className="flex items-center gap-2 text-xs cursor-pointer">
+                      <input
+                        type="color"
+                        value={lyricColor}
+                        onChange={(e) => setLyricColor(e.target.value)}
+                        className="w-8 h-8 rounded-md border border-white/10 bg-transparent p-0 cursor-pointer"
+                      />
+                      Active lyric text
+                    </label>
+                  </div>
+
+                  <div>
+                    <span className="text-[11px] font-semibold text-text-dim uppercase tracking-wide block mb-2">
+                      Lyric font
+                    </span>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <label
+                        className={`${BTN_BASE} bg-panel-2 hover:bg-[#2E2136]`}
+                        title="Use an uploaded font for the lyric text"
+                      >
+                        <Type size={16} />
+                        <span>{fontName || 'Upload font'}</span>
+                        <input
+                          type="file"
+                          accept=".woff2,.woff,.ttf,.otf"
+                          onChange={handleFontFile}
+                          className="hidden"
+                        />
+                      </label>
+                      {fontName && (
+                        <button
+                          className={`${BTN_BASE} bg-panel-2 hover:bg-[#2E2136]`}
+                          onClick={handleResetFont}
+                          title="Reset to default font"
+                        >
+                          <RotateCcw size={16} />
+                        </button>
+                      )}
+                    </div>
+                    {fontError && <div className="text-xs text-[#E14F84] mt-1.5">{fontError}</div>}
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
         </div>
         {glbError && <div className="w-full text-xs text-[#E14F84] mt-1.5">{glbError}</div>}
-        {fontError && <div className="w-full text-xs text-[#E14F84] mt-1.5">{fontError}</div>}
       </header>
 
       <Stage
@@ -538,6 +710,9 @@ export default function LyricBloom() {
         particleShapeBuffer={glbBuffer}
         onShapeError={handleShapeError}
         fontBuffer={fontBuffer}
+        palette={palette}
+        stageColors={stageColors}
+        textColor={lyricColor}
       />
 
       <div className="flex gap-2.5 items-start">
@@ -576,12 +751,17 @@ export default function LyricBloom() {
       </div>
 
       <div className="bg-panel rounded-xl p-3 overflow-x-auto">
-        <div className="relative h-5 mb-1" style={{ width: `${timeToX(audioDuration)}px` }}>
+        <div
+          className={`relative h-5 mb-1 select-none ${audioURL ? 'cursor-pointer' : ''}`}
+          style={{ width: `${timeToX(audioDuration)}px` }}
+          onPointerDown={handleRulerPointerDown}
+          title={audioURL ? 'Drag to scrub the playhead' : undefined}
+        >
           {ticks}
         </div>
         <div
           ref={trackRef}
-          className={`relative h-[74px] rounded-lg transition-colors duration-150 ${isDragOver ? 'bg-[#33253C]' : 'bg-panel-2'}`}
+          className={`relative h-[74px] rounded-lg transition-colors duration-150 ${isDragOver ? 'bg-timeline-active' : 'bg-timeline'}`}
           style={{ width: `${timeToX(audioDuration)}px` }}
           onDragOver={(e) => { e.preventDefault(); setIsDragOver(true); }}
           onDragLeave={() => setIsDragOver(false)}
@@ -595,7 +775,7 @@ export default function LyricBloom() {
           {placedBlocks.map((block) => (
             <div
               key={block.id}
-              className="absolute top-2.5 h-[54px] rounded-[60%_40%_55%_45%/55%_45%_60%_40%] px-[18px] flex items-center cursor-grab active:cursor-grabbing shadow-[0_3px_10px_rgba(0,0,0,0.35)] min-w-[60px]"
+              className="absolute top-2.5 h-[54px] rounded-md px-[18px] flex items-center cursor-grab active:cursor-grabbing shadow-[0_3px_10px_rgba(0,0,0,0.35)] min-w-[60px]"
               style={{
                 left: `${timeToX(block.start)}px`,
                 width: `${timeToX(block.duration)}px`,

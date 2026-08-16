@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import Stage from './Stage.jsx';
 import { STAGE_CHANNEL_NAME } from './lib/stageChannel.js';
+import { FLORAL_PALETTE, DEFAULT_STAGE_COLORS, DEFAULT_LYRIC_COLOR } from './lib/palette.js';
 
 /* =========================================================================
    StagePopout — the visualizer-only view opened in a second tab.
@@ -18,6 +19,9 @@ export default function StagePopout() {
 
   const [shapeBuffer, setShapeBuffer] = useState(null);
   const [fontBuffer, setFontBuffer] = useState(null);
+  const [palette, setPalette] = useState(FLORAL_PALETTE);
+  const [stageColors, setStageColors] = useState(DEFAULT_STAGE_COLORS);
+  const [lyricColor, setLyricColor] = useState(DEFAULT_LYRIC_COLOR);
 
   useEffect(() => {
     const channel = new BroadcastChannel(STAGE_CHANNEL_NAME);
@@ -37,6 +41,15 @@ export default function StagePopout() {
           break;
         case 'font':
           setFontBuffer(msg.buffer);
+          break;
+        case 'palette':
+          setPalette(msg.palette);
+          break;
+        case 'stageColors':
+          setStageColors(msg.stageColors);
+          break;
+        case 'lyricColor':
+          setLyricColor(msg.lyricColor);
           break;
         default:
           break;
@@ -60,6 +73,9 @@ export default function StagePopout() {
         placedBlocksRef={placedBlocksRef}
         particleShapeBuffer={shapeBuffer}
         fontBuffer={fontBuffer}
+        palette={palette}
+        stageColors={stageColors}
+        textColor={lyricColor}
         heightClassName="h-screen"
       />
     </div>

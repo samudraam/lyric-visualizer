@@ -1,7 +1,7 @@
 import { useRef, useState, useEffect } from 'react';
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
-import { FLORAL_PALETTE } from './lib/palette.js';
+import { FLORAL_PALETTE, DEFAULT_STAGE_COLORS, DEFAULT_LYRIC_COLOR } from './lib/palette.js';
 import { loadCustomFont, CUSTOM_FONT_FAMILY } from './lib/font.js';
 
 /* =========================================================================
@@ -38,7 +38,7 @@ const MESH_PARTICLE_COUNT = 220;
 // Generates the shared physics state for a batch of falling particles —
 // starting position, fall speed, drift phase, and a palette color — used
 // by both the default sprite points and the custom-shape instanced mesh.
-function createParticleField(count) {
+function createParticleField(count, palette) {
   const positions = new Float32Array(count * 3);
   const colors = new Float32Array(count * 3);
   const speeds = new Float32Array(count);
@@ -52,7 +52,7 @@ function createParticleField(count) {
     speeds[i] = 0.006 + Math.random() * 0.018;
     phases[i] = Math.random() * Math.PI * 2;
 
-    const hex = FLORAL_PALETTE[Math.floor(Math.random() * FLORAL_PALETTE.length)];
+    const hex = palette[Math.floor(Math.random() * palette.length)];
     const c = new THREE.Color(hex);
     colors[i * 3] = c.r;
     colors[i * 3 + 1] = c.g;
@@ -113,6 +113,9 @@ export default function Stage({
   particleShapeBuffer,
   onShapeError,
   fontBuffer,
+  palette = FLORAL_PALETTE,
+  stageColors = DEFAULT_STAGE_COLORS,
+  textColor = DEFAULT_LYRIC_COLOR,
   heightClassName = DEFAULT_HEIGHT_CLASSES,
 }) {
   const [activeLyric, setActiveLyric] = useState('');
@@ -147,6 +150,10 @@ export default function Stage({
   const sceneRef = useRef(null);       // so buildParticles() can run outside the mount effect
   // { mode: 'points' | 'mesh', object3D, positions, speeds, phases, count, dummy? }
   const particlesRef = useRef(null);
+  // Remembers the currently-active custom shape (or null for default sprite
+  // points) so the palette-change effect below can rebuild particles without
+  // needing to re-parse the .glb — it just re-reads whatever shape is live.
+  const shapeGeometryRef = useRef(null);
 
   /* =======================================================================
      PARTICLE SYSTEM BUILDER
@@ -170,7 +177,7 @@ export default function Stage({
     }
 
     if (shapeGeometry) {
-      const field = createParticleField(MESH_PARTICLE_COUNT);
+      const field = createParticleField(MESH_PARTICLE_COUNT, palette);
       // No vertexColors flag here — per-instance tinting goes through
       // InstancedMesh's own instanceColor channel, which doesn't require
       // the uploaded geometry to carry a vertex color attribute.
@@ -189,7 +196,7 @@ export default function Stage({
       scene.add(mesh);
       particlesRef.current = { mode: 'mesh', object3D: mesh, dummy, ...field };
     } else {
-      const field = createParticleField(POINTS_PARTICLE_COUNT);
+      const field = createParticleField(POINTS_PARTICLE_COUNT, palette);
       const geometry = new THREE.BufferGeometry();
       geometry.setAttribute('position', new THREE.BufferAttribute(field.positions, 3));
       geometry.setAttribute('color', new THREE.BufferAttribute(field.colors, 3));
@@ -342,6 +349,7 @@ export default function Stage({
      ======================================================================= */
   useEffect(() => {
     if (!particleShapeBuffer) {
+      shapeGeometryRef.current = null;
       buildParticles(null);
       return;
     }
@@ -357,6 +365,7 @@ export default function Stage({
           onShapeError?.('No mesh found in that file.');
           return;
         }
+        shapeGeometryRef.current = geometry;
         buildParticles(geometry);
       },
       () => {
@@ -369,14 +378,25 @@ export default function Stage({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [particleShapeBuffer]);
 
+  // Re-tint particles when the palette changes in the settings menu — reuses
+  // whatever shape is currently active (default points or an uploaded .glb)
+  // rather than re-parsing anything.
+  useEffect(() => {
+    buildParticles(shapeGeometryRef.current);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [palette]);
+
   return (
-    <div className={`relative ${heightClassName} rounded-2xl overflow-hidden bg-[radial-gradient(circle_at_50%_30%,#241A29,var(--color-bg))]`}>
+    <div
+      className={`relative ${heightClassName} rounded-2xl overflow-hidden`}
+      style={{ backgroundImage: `radial-gradient(circle at 50% 30%, ${stageColors.inner}, ${stageColors.outer})` }}
+    >
       <div ref={mountRef} className="absolute inset-0" />
       <div className="absolute inset-0 flex items-center justify-center pointer-events-none px-10">
         <div
           key={activeLyric}
           className={`font-display font-semibold text-[clamp(20px,4vw,40px)] text-center [text-shadow:0_4px_24px_rgba(0,0,0,0.6)] opacity-0 ${activeLyric ? 'animate-fade-in-up' : ''}`}
-          style={fontLoaded ? { fontFamily: CUSTOM_FONT_FAMILY } : undefined}
+          style={{ color: textColor, ...(fontLoaded ? { fontFamily: CUSTOM_FONT_FAMILY } : null) }}
         >
           {activeLyric}
         </div>

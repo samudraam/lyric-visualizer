@@ -9,4 +9,7 @@ export const STAGE_CHANNEL_NAME = 'lyric-bloom-stage';
 //   { type: 'lyrics', placedBlocks }                — editor → popout, on edit
 //   { type: 'shape', buffer }                       — editor → popout, on .glb upload/reset
 //   { type: 'font', buffer }                        — editor → popout, on font upload/reset
+//   { type: 'palette', palette }                     — editor → popout, on settings-menu edit
+//   { type: 'stageColors', stageColors }             — editor → popout, on settings-menu edit
+//   { type: 'lyricColor', lyricColor }                — editor → popout, on settings-menu edit
 //   { type: 'ready' }                                — popout → editor, once on mount
