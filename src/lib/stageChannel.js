@@ -12,4 +12,6 @@ export const STAGE_CHANNEL_NAME = 'lyric-bloom-stage';
 //   { type: 'palette', palette }                     — editor → popout, on settings-menu edit
 //   { type: 'stageColors', stageColors }             — editor → popout, on settings-menu edit
 //   { type: 'lyricColor', lyricColor }                — editor → popout, on settings-menu edit
+//   { type: 'lyricSize', lyricSize }                  — editor → popout, on settings-menu edit
+//   { type: 'particleSize', particleSize }             — editor → popout, on settings-menu edit
 //   { type: 'ready' }                                — popout → editor, once on mount

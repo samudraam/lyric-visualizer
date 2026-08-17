@@ -1,7 +1,7 @@
 import { useRef, useState, useEffect } from 'react';
 import { Play, Pause, Upload, Plus, Box, RotateCcw, Type, ExternalLink, Settings } from 'lucide-react';
 import Stage from './Stage.jsx';
-import { FLORAL_PALETTE, DEFAULT_STAGE_COLORS, DEFAULT_LYRIC_COLOR } from './lib/palette.js';
+import { FLORAL_PALETTE, DEFAULT_STAGE_COLORS, DEFAULT_LYRIC_COLOR, DEFAULT_LYRIC_SIZE, DEFAULT_PARTICLE_SIZE } from './lib/palette.js';
 import { loadCustomFont, CUSTOM_FONT_FAMILY } from './lib/font.js';
 import { STAGE_CHANNEL_NAME } from './lib/stageChannel.js';
 
@@ -75,6 +75,8 @@ export default function LyricBloom() {
   const [palette, setPalette] = useState(FLORAL_PALETTE);       // lyric-block + particle colors, editable in settings
   const [stageColors, setStageColors] = useState(DEFAULT_STAGE_COLORS); // Stage's background gradient stops
   const [lyricColor, setLyricColor] = useState(DEFAULT_LYRIC_COLOR); // active-lyric text color on Stage
+  const [lyricSize, setLyricSize] = useState(DEFAULT_LYRIC_SIZE); // active-lyric max font size (px) on Stage
+  const [particleSize, setParticleSize] = useState(DEFAULT_PARTICLE_SIZE); // uploaded .glb particle scale on Stage
 
   /* =======================================================================
      REFS
@@ -137,6 +139,8 @@ export default function LyricBloom() {
   const paletteRef = useRef(palette);
   const stageColorsRef = useRef(stageColors);
   const lyricColorRef = useRef(lyricColor);
+  const lyricSizeRef = useRef(lyricSize);
+  const particleSizeRef = useRef(particleSize);
 
   useEffect(() => {
     const channel = new BroadcastChannel(STAGE_CHANNEL_NAME);
@@ -152,6 +156,8 @@ export default function LyricBloom() {
       channel.postMessage({ type: 'palette', palette: paletteRef.current });
       channel.postMessage({ type: 'stageColors', stageColors: stageColorsRef.current });
       channel.postMessage({ type: 'lyricColor', lyricColor: lyricColorRef.current });
+      channel.postMessage({ type: 'lyricSize', lyricSize: lyricSizeRef.current });
+      channel.postMessage({ type: 'particleSize', particleSize: particleSizeRef.current });
     };
 
     return () => channel.close();
@@ -185,6 +191,16 @@ export default function LyricBloom() {
     lyricColorRef.current = lyricColor;
     channelRef.current?.postMessage({ type: 'lyricColor', lyricColor });
   }, [lyricColor]);
+
+  useEffect(() => {
+    lyricSizeRef.current = lyricSize;
+    channelRef.current?.postMessage({ type: 'lyricSize', lyricSize });
+  }, [lyricSize]);
+
+  useEffect(() => {
+    particleSizeRef.current = particleSize;
+    channelRef.current?.postMessage({ type: 'particleSize', particleSize });
+  }, [particleSize]);
 
   /* =======================================================================
      AUDIO-SYNC LOOP — runs exactly once (empty dependency array)
@@ -371,6 +387,10 @@ export default function LyricBloom() {
   const handleResetStageColors = () => setStageColors(DEFAULT_STAGE_COLORS);
 
   const handleResetLyricColor = () => setLyricColor(DEFAULT_LYRIC_COLOR);
+
+  const handleResetLyricSize = () => setLyricSize(DEFAULT_LYRIC_SIZE);
+
+  const handleResetParticleSize = () => setParticleSize(DEFAULT_PARTICLE_SIZE);
 
   // Opens the visualizer-only pop-out. A named window target means clicking
   // this again re-focuses the same tab instead of spawning duplicates.
@@ -614,6 +634,31 @@ export default function LyricBloom() {
 
                   <div>
                     <div className="flex items-center justify-between mb-2">
+                      <span className="text-[11px] font-semibold text-text-dim uppercase tracking-wide">Particle size</span>
+                      <button
+                        className="text-[11px] text-text-dim hover:text-text hover:underline underline-offset-2 cursor-pointer"
+                        onClick={handleResetParticleSize}
+                      >
+                        Reset
+                      </button>
+                    </div>
+                    <div className="flex items-center gap-3">
+                      <input
+                        type="range"
+                        min="0.1"
+                        max="1.2"
+                        step="0.05"
+                        value={particleSize}
+                        onChange={(e) => setParticleSize(Number(e.target.value))}
+                        className="flex-1 cursor-pointer accent-accent"
+                        title="Size of an uploaded .glb particle shape"
+                      />
+                      <span className="text-xs text-text-dim w-11 text-right tabular-nums">{particleSize.toFixed(2)}</span>
+                    </div>
+                  </div>
+
+                  <div>
+                    <div className="flex items-center justify-between mb-2">
                       <span className="text-[11px] font-semibold text-text-dim uppercase tracking-wide">Stage colors</span>
                       <button
                         className="text-[11px] text-text-dim hover:text-text hover:underline underline-offset-2 cursor-pointer"
@@ -666,6 +711,30 @@ export default function LyricBloom() {
                   </div>
 
                   <div>
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="text-[11px] font-semibold text-text-dim uppercase tracking-wide">Font size</span>
+                      <button
+                        className="text-[11px] text-text-dim hover:text-text hover:underline underline-offset-2 cursor-pointer"
+                        onClick={handleResetLyricSize}
+                      >
+                        Reset
+                      </button>
+                    </div>
+                    <div className="flex items-center gap-3">
+                      <input
+                        type="range"
+                        min="16"
+                        max="200"
+                        step="1"
+                        value={lyricSize}
+                        onChange={(e) => setLyricSize(Number(e.target.value))}
+                        className="flex-1 cursor-pointer accent-accent"
+                      />
+                      <span className="text-xs text-text-dim w-11 text-right tabular-nums">{lyricSize}px</span>
+                    </div>
+                  </div>
+
+                  <div>
                     <span className="text-[11px] font-semibold text-text-dim uppercase tracking-wide block mb-2">
                       Lyric font
                     </span>
@@ -713,6 +782,8 @@ export default function LyricBloom() {
         palette={palette}
         stageColors={stageColors}
         textColor={lyricColor}
+        textSize={lyricSize}
+        particleSize={particleSize}
       />
 
       <div className="flex gap-2.5 items-start">

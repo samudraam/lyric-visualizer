@@ -1,7 +1,7 @@
 import { useRef, useState, useEffect } from 'react';
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
-import { FLORAL_PALETTE, DEFAULT_STAGE_COLORS, DEFAULT_LYRIC_COLOR } from './lib/palette.js';
+import { FLORAL_PALETTE, DEFAULT_STAGE_COLORS, DEFAULT_LYRIC_COLOR, DEFAULT_LYRIC_SIZE, DEFAULT_PARTICLE_SIZE } from './lib/palette.js';
 import { loadCustomFont, CUSTOM_FONT_FAMILY } from './lib/font.js';
 
 /* =========================================================================
@@ -62,9 +62,12 @@ function createParticleField(count, palette) {
   return { positions, colors, speeds, phases, count };
 }
 
-// Pulls the first mesh out of a loaded glTF, then centers and rescales its
-// geometry so uploaded models — regardless of their original size/origin —
-// read at roughly the same visual weight as the default particle sprites.
+// Pulls the first mesh out of a loaded glTF, then centers it and normalizes
+// its geometry to a max dimension of 1 — regardless of the original model's
+// size/origin, so it can be scaled to any on-screen size later. The actual
+// visual size is applied per-frame in the animate loop below (particleSize
+// prop × the bass-reactive pulse), so adjusting it doesn't require re-parsing
+// the .glb.
 function extractParticleGeometry(gltf) {
   gltf.scene.updateMatrixWorld(true);
 
@@ -86,7 +89,7 @@ function extractParticleGeometry(gltf) {
   const size = new THREE.Vector3();
   box.getSize(size);
   const maxDim = Math.max(size.x, size.y, size.z) || 1;
-  const scale = 0.4 / maxDim;
+  const scale = 1 / maxDim;
   geometry.scale(scale, scale, scale);
 
   return geometry;
@@ -116,6 +119,8 @@ export default function Stage({
   palette = FLORAL_PALETTE,
   stageColors = DEFAULT_STAGE_COLORS,
   textColor = DEFAULT_LYRIC_COLOR,
+  textSize = DEFAULT_LYRIC_SIZE,
+  particleSize = DEFAULT_PARTICLE_SIZE,
   heightClassName = DEFAULT_HEIGHT_CLASSES,
 }) {
   const [activeLyric, setActiveLyric] = useState('');
@@ -154,6 +159,13 @@ export default function Stage({
   // points) so the palette-change effect below can rebuild particles without
   // needing to re-parse the .glb — it just re-reads whatever shape is live.
   const shapeGeometryRef = useRef(null);
+  // The animate loop below is set up once on mount (empty dependency array),
+  // so it reads particleSize through this ref instead of the prop directly —
+  // same "live mirror" trick as bassRef/audioTimeRef.
+  const particleSizeRef = useRef(particleSize);
+  useEffect(() => {
+    particleSizeRef.current = particleSize;
+  }, [particleSize]);
 
   /* =======================================================================
      PARTICLE SYSTEM BUILDER
@@ -281,7 +293,7 @@ export default function Stage({
       } else {
         // Instanced .glb shapes: no geometry attribute to touch — each
         // particle's transform is written straight into the instance matrix.
-        const scale = 1 + bass * 0.5;
+        const scale = particleSizeRef.current * (1 + bass * 0.5);
         for (let i = 0; i < p.count; i++) {
           p.dummy.position.set(p.positions[i * 3], p.positions[i * 3 + 1], p.positions[i * 3 + 2]);
           p.dummy.rotation.set(t * 0.3 + p.phases[i], t * 0.2 + p.phases[i] * 1.3, 0);
@@ -395,8 +407,12 @@ export default function Stage({
       <div className="absolute inset-0 flex items-center justify-center pointer-events-none px-10">
         <div
           key={activeLyric}
-          className={`font-display font-semibold text-[clamp(20px,4vw,40px)] text-center [text-shadow:0_4px_24px_rgba(0,0,0,0.6)] opacity-0 ${activeLyric ? 'animate-fade-in-up' : ''}`}
-          style={{ color: textColor, ...(fontLoaded ? { fontFamily: CUSTOM_FONT_FAMILY } : null) }}
+          className={`font-display font-semibold text-center [text-shadow:0_4px_24px_rgba(0,0,0,0.6)] opacity-0 ${activeLyric ? 'animate-fade-in-up' : ''}`}
+          style={{
+            color: textColor,
+            fontSize: `clamp(${Math.round(textSize / 2)}px, 4vw, ${textSize}px)`,
+            ...(fontLoaded ? { fontFamily: CUSTOM_FONT_FAMILY } : null),
+          }}
         >
           {activeLyric}
         </div>
