@@ -1,5 +1,5 @@
 import { useRef, useState, useEffect } from 'react';
-import { Play, Pause, Upload, Plus, Box, RotateCcw, Type, ExternalLink, Settings } from 'lucide-react';
+import { Play, Pause, Upload, Plus, Box, X, RotateCcw, Type, ExternalLink, Settings } from 'lucide-react';
 import Stage from './Stage.jsx';
 import { FLORAL_PALETTE, DEFAULT_STAGE_COLORS, DEFAULT_LYRIC_COLOR, DEFAULT_LYRIC_SIZE, DEFAULT_PARTICLE_SIZE } from './lib/palette.js';
 import { loadCustomFont, CUSTOM_FONT_FAMILY } from './lib/font.js';
@@ -410,6 +410,13 @@ export default function LyricBloom() {
     setLyricInput('');
   };
 
+/* =======================================================================
+  Handle Remove Lyrics
+  ======================================================================= */
+  const handleRemoveFromBank = (id) => {
+    setLyricBank(prev => prev.filter(b => b.id !== id))
+  };
+
   /* =======================================================================
      DRAG FROM BANK → DROP ONTO TIMELINE
      -----------------------------------------------------------------------
@@ -811,12 +818,15 @@ export default function LyricBloom() {
         {lyricBank.map((item) => (
           <div
             key={item.id}
-            className="bg-panel-2 border border-white/10 rounded-full px-3.5 py-1.5 text-xs cursor-grab select-none active:cursor-grabbing"
+            className="flex items-center gap-1.5 bg-panel-2 border border-white/10 rounded-full px-3.5 py-1.5 text-xs cursor-grab select-none active:cursor-grabbing"
             style={fontLoaded ? { fontFamily: CUSTOM_FONT_FAMILY } : undefined}
             draggable
             onDragStart={(e) => handleDragStart(e, item)}
           >
-            {item.text}
+            <span>{item.text}</span>
+            <button onClick={(e)=> {e.stopPropagation(); handleRemoveFromBank(item.id);}}>
+              <X size = {12} />
+            </button>
           </div>
         ))}
       </div>
