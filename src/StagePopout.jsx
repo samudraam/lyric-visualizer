@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import Stage from './Stage.jsx';
 import { STAGE_CHANNEL_NAME } from './lib/stageChannel.js';
 import { FLORAL_PALETTE, DEFAULT_STAGE_COLORS, DEFAULT_LYRIC_COLOR, DEFAULT_LYRIC_SIZE, DEFAULT_PARTICLE_SIZE } from './lib/palette.js';
+import { DEFAULT_TEXT_EFFECT } from './lib/textEffects.js';
 
 /* =========================================================================
    StagePopout — the visualizer-only view opened in a second tab.
@@ -16,6 +17,10 @@ export default function StagePopout() {
   const audioTimeRef = useRef({ currentTime: 0, duration: 0 });
   const bassRef = useRef(0);
   const placedBlocksRef = useRef([]);
+  // Mirrors placedBlocksRef into real state too — Stage's per-block font
+  // preloading effect needs a reactive prop to key off of, not just a ref it
+  // only reads once per animation frame.
+  const [placedBlocks, setPlacedBlocks] = useState([]);
 
   const [shapeBuffer, setShapeBuffer] = useState(null);
   const [fontBuffer, setFontBuffer] = useState(null);
@@ -24,6 +29,7 @@ export default function StagePopout() {
   const [lyricColor, setLyricColor] = useState(DEFAULT_LYRIC_COLOR);
   const [lyricSize, setLyricSize] = useState(DEFAULT_LYRIC_SIZE);
   const [particleSize, setParticleSize] = useState(DEFAULT_PARTICLE_SIZE);
+  const [textEffect, setTextEffect] = useState(DEFAULT_TEXT_EFFECT);
 
   useEffect(() => {
     const channel = new BroadcastChannel(STAGE_CHANNEL_NAME);
@@ -37,6 +43,7 @@ export default function StagePopout() {
           break;
         case 'lyrics':
           placedBlocksRef.current = msg.placedBlocks;
+          setPlacedBlocks(msg.placedBlocks);
           break;
         case 'shape':
           setShapeBuffer(msg.buffer);
@@ -59,6 +66,9 @@ export default function StagePopout() {
         case 'particleSize':
           setParticleSize(msg.particleSize);
           break;
+        case 'textEffect':
+          setTextEffect(msg.textEffect);
+          break;
         default:
           break;
       }
@@ -79,6 +89,7 @@ export default function StagePopout() {
         audioTimeRef={audioTimeRef}
         bassRef={bassRef}
         placedBlocksRef={placedBlocksRef}
+        placedBlocks={placedBlocks}
         particleShapeBuffer={shapeBuffer}
         fontBuffer={fontBuffer}
         palette={palette}
@@ -86,6 +97,7 @@ export default function StagePopout() {
         textColor={lyricColor}
         textSize={lyricSize}
         particleSize={particleSize}
+        textEffect={textEffect}
         heightClassName="h-screen"
       />
     </div>

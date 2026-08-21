@@ -4,6 +4,8 @@ import Stage from './Stage.jsx';
 import { FLORAL_PALETTE, DEFAULT_STAGE_COLORS, DEFAULT_LYRIC_COLOR, DEFAULT_LYRIC_SIZE, DEFAULT_PARTICLE_SIZE } from './lib/palette.js';
 import { loadCustomFont, CUSTOM_FONT_FAMILY } from './lib/font.js';
 import { STAGE_CHANNEL_NAME } from './lib/stageChannel.js';
+import { TEXT_EFFECTS, DEFAULT_TEXT_EFFECT } from './lib/textEffects.js';
+import { loadState, saveState } from './lib/persistence.js';
 
 /* =========================================================================
    MODULE-LEVEL CONSTANTS & PURE HELPER FUNCTIONS
@@ -51,10 +53,17 @@ export default function LyricBloom() {
      readout, the particle animation itself) is handled OUTSIDE React state
      below, via refs + direct DOM writes — see the audio-sync loop for why.
      ======================================================================= */
-  const [lyricBank, setLyricBank] = useState([]);       // lines not yet placed: [{id, text}]
-  const [placedBlocks, setPlacedBlocks] = useState([]);  // [{id, text, start, duration, color}]
+  // Read once, synchronously, on the very first render — so restored values
+  // are there for the initial paint instead of flashing defaults first. Only
+  // lyrics/timeline + settings-menu values are persisted; uploaded audio/
+  // font/shape files are binary blobs well past what localStorage should
+  // hold, so those still need to be re-selected after a reload.
+  const [savedState] = useState(() => loadState() || {});
+
+  const [lyricBank, setLyricBank] = useState(savedState.lyricBank ?? []);       // lines not yet placed: [{id, text}]
+  const [placedBlocks, setPlacedBlocks] = useState(savedState.placedBlocks ?? []);  // [{id, text, start, duration, color}]
   const [lyricInput, setLyricInput] = useState('');
-  const [nextId, setNextId] = useState(1);
+  const [nextId, setNextId] = useState(savedState.nextId ?? 1);
 
   const [audioURL, setAudioURL] = useState(null);
   const [audioName, setAudioName] = useState('');
@@ -72,11 +81,13 @@ export default function LyricBloom() {
   const [fontLoaded, setFontLoaded] = useState(false); // whether the uploaded font has finished loading in THIS document
 
   const [showSettings, setShowSettings] = useState(false); // palette/stage-color/font settings menu
-  const [palette, setPalette] = useState(FLORAL_PALETTE);       // lyric-block + particle colors, editable in settings
-  const [stageColors, setStageColors] = useState(DEFAULT_STAGE_COLORS); // Stage's background gradient stops
-  const [lyricColor, setLyricColor] = useState(DEFAULT_LYRIC_COLOR); // active-lyric text color on Stage
-  const [lyricSize, setLyricSize] = useState(DEFAULT_LYRIC_SIZE); // active-lyric max font size (px) on Stage
-  const [particleSize, setParticleSize] = useState(DEFAULT_PARTICLE_SIZE); // uploaded .glb particle scale on Stage
+  const [selectedBlockId, setSelectedBlockId] = useState(null); // placed block currently shown in the settings menu's per-chip section
+  const [palette, setPalette] = useState(savedState.palette ?? FLORAL_PALETTE);       // lyric-block + particle colors, editable in settings
+  const [stageColors, setStageColors] = useState(savedState.stageColors ?? DEFAULT_STAGE_COLORS); // Stage's background gradient stops
+  const [lyricColor, setLyricColor] = useState(savedState.lyricColor ?? DEFAULT_LYRIC_COLOR); // active-lyric text color on Stage
+  const [lyricSize, setLyricSize] = useState(savedState.lyricSize ?? DEFAULT_LYRIC_SIZE); // active-lyric max font size (px) on Stage
+  const [particleSize, setParticleSize] = useState(savedState.particleSize ?? DEFAULT_PARTICLE_SIZE); // uploaded .glb particle scale on Stage
+  const [textEffect, setTextEffect] = useState(savedState.textEffect ?? DEFAULT_TEXT_EFFECT); // active-lyric WebGL shader id, see lib/textEffects.js
 
   /* =======================================================================
      REFS
@@ -115,6 +126,36 @@ export default function LyricBloom() {
     placedBlocksRef.current = placedBlocks;
   }, [placedBlocks]);
 
+  // Persist lyrics/timeline + settings-menu state to localStorage on every
+  // change, so a reload picks up where this session left off (see the
+  // matching read in the savedState initializer above).
+  useEffect(() => {
+    saveState({
+      lyricBank,
+      // Persist each block's own overrides, but not its uploaded font bytes
+      // — binary, and excluded for the same reason the global font upload
+      // is (see savedState initializer above). fontName is kept as a small
+      // hint; the font itself needs re-uploading after a reload.
+      placedBlocks: placedBlocks.map((b) => ({
+        id: b.id,
+        text: b.text,
+        start: b.start,
+        duration: b.duration,
+        color: b.color,
+        textColor: b.textColor,
+        textEffect: b.textEffect,
+        fontName: b.fontName,
+      })),
+      nextId,
+      palette,
+      stageColors,
+      lyricColor,
+      lyricSize,
+      particleSize,
+      textEffect,
+    });
+  }, [lyricBank, placedBlocks, nextId, palette, stageColors, lyricColor, lyricSize, particleSize, textEffect]);
+
   // Revoke the previous object URL when a new audio file is chosen, or on
   // unmount — object URLs hold a reference to the underlying file blob in
   // memory until explicitly released.
@@ -141,6 +182,7 @@ export default function LyricBloom() {
   const lyricColorRef = useRef(lyricColor);
   const lyricSizeRef = useRef(lyricSize);
   const particleSizeRef = useRef(particleSize);
+  const textEffectRef = useRef(textEffect);
 
   useEffect(() => {
     const channel = new BroadcastChannel(STAGE_CHANNEL_NAME);
@@ -158,6 +200,7 @@ export default function LyricBloom() {
       channel.postMessage({ type: 'lyricColor', lyricColor: lyricColorRef.current });
       channel.postMessage({ type: 'lyricSize', lyricSize: lyricSizeRef.current });
       channel.postMessage({ type: 'particleSize', particleSize: particleSizeRef.current });
+      channel.postMessage({ type: 'textEffect', textEffect: textEffectRef.current });
     };
 
     return () => channel.close();
@@ -201,6 +244,11 @@ export default function LyricBloom() {
     particleSizeRef.current = particleSize;
     channelRef.current?.postMessage({ type: 'particleSize', particleSize });
   }, [particleSize]);
+
+  useEffect(() => {
+    textEffectRef.current = textEffect;
+    channelRef.current?.postMessage({ type: 'textEffect', textEffect });
+  }, [textEffect]);
 
   /* =======================================================================
      AUDIO-SYNC LOOP — runs exactly once (empty dependency array)
@@ -392,6 +440,8 @@ export default function LyricBloom() {
 
   const handleResetParticleSize = () => setParticleSize(DEFAULT_PARTICLE_SIZE);
 
+  const handleResetTextEffect = () => setTextEffect(DEFAULT_TEXT_EFFECT);
+
   // Opens the visualizer-only pop-out. A named window target means clicking
   // this again re-focuses the same tab instead of spawning duplicates.
   const openStagePopout = () => {
@@ -455,7 +505,34 @@ export default function LyricBloom() {
   const handleRemoveBlock = (block) => {
     setPlacedBlocks((prev) => prev.filter((b) => b.id !== block.id));
     setLyricBank((prev) => [...prev, { id: block.id, text: block.text }]);
+    setSelectedBlockId((prev) => (prev === block.id ? null : prev));
   };
+
+  /* =======================================================================
+     PER-CHIP OVERRIDES — text color/effect/font for the selected placed
+     block, editable from the settings menu's "Chip" section. Any field left
+     unset falls back to the matching global setting — see the "effective *"
+     values Stage.jsx derives from a block's own fields.
+     ======================================================================= */
+  const updateSelectedBlock = (patch) => {
+    setPlacedBlocks((prev) => prev.map((b) => (b.id === selectedBlockId ? { ...b, ...patch } : b)));
+  };
+
+  const handleBlockTextColorChange = (value) => updateSelectedBlock({ textColor: value });
+  const handleResetBlockTextColor = () => updateSelectedBlock({ textColor: undefined });
+
+  const handleBlockTextEffectChange = (value) => updateSelectedBlock({ textEffect: value });
+  const handleResetBlockTextEffect = () => updateSelectedBlock({ textEffect: undefined });
+
+  const handleBlockFontFile = (e) => {
+    const file = e.target.files[0];
+    e.target.value = '';
+    if (!file) return;
+    file.arrayBuffer()
+      .then((buffer) => updateSelectedBlock({ fontBuffer: buffer, fontName: file.name }))
+      .catch(() => {});
+  };
+  const handleResetBlockFont = () => updateSelectedBlock({ fontBuffer: undefined, fontName: undefined });
 
   /* =======================================================================
      REPOSITION / RESIZE PLACED BLOCKS
@@ -470,12 +547,25 @@ export default function LyricBloom() {
        tracking even if the cursor moves faster than the block and briefly
        leaves its bounding box.
      ======================================================================= */
+  // How far the pointer has to move before a press counts as a drag rather
+  // than a click — below this, releasing selects the block for editing
+  // instead. Without this, every reposition drag also fires a native click
+  // at pointerup (mousedown/up landed on the same element regardless of the
+  // distance dragged between them), which reopened the edit menu mid-drag.
+  const CLICK_DRAG_THRESHOLD = 4;
+
   const handleBlockPointerDown = (e, block) => {
     e.stopPropagation();
+    if (e.button !== 0) return; // left button only — no drag/select on right- or middle-click
     const startX = e.clientX;
+    const startY = e.clientY;
     const startTime = block.start;
+    let dragged = false;
 
     const onMove = (ev) => {
+      if (!dragged && (Math.abs(ev.clientX - startX) > CLICK_DRAG_THRESHOLD || Math.abs(ev.clientY - startY) > CLICK_DRAG_THRESHOLD)) {
+        dragged = true;
+      }
       const deltaTime = (ev.clientX - startX) / PIXELS_PER_SECOND;
       const newStart = clamp(startTime + deltaTime, 0, Math.max(0, audioDuration - block.duration));
       setPlacedBlocks((prev) => prev.map((b) => (b.id === block.id ? { ...b, start: newStart } : b)));
@@ -483,6 +573,10 @@ export default function LyricBloom() {
     const onUp = () => {
       document.removeEventListener('pointermove', onMove);
       document.removeEventListener('pointerup', onUp);
+      if (!dragged) {
+        setSelectedBlockId(block.id);
+        setShowSettings(true);
+      }
     };
     document.addEventListener('pointermove', onMove);
     document.addEventListener('pointerup', onUp);
@@ -490,6 +584,7 @@ export default function LyricBloom() {
 
   const handleResizePointerDown = (e, block) => {
     e.stopPropagation();
+    if (e.button !== 0) return; // left button only
     const startX = e.clientX;
     const startDuration = block.duration;
 
@@ -532,6 +627,8 @@ export default function LyricBloom() {
     document.addEventListener('pointermove', onMove);
     document.addEventListener('pointerup', onUp);
   };
+
+  const selectedBlock = placedBlocks.find((b) => b.id === selectedBlockId) || null;
 
   // Build ruler tick marks once per render — cheap, and audioDuration only
   // changes rarely (on file load), so no need to memoize with useMemo here.
@@ -615,6 +712,88 @@ export default function LyricBloom() {
               <>
                 <div className="fixed inset-0 z-40" onClick={() => setShowSettings(false)} />
                 <div className="absolute right-0 top-full mt-2 z-50 w-72 bg-panel border border-white/10 rounded-xl p-4 shadow-[0_8px_30px_rgba(0,0,0,0.5)] flex flex-col gap-4 text-left">
+                  {selectedBlock && (
+                    <div className="border border-white/10 rounded-lg p-3 bg-panel-2/40">
+                      <div className="flex items-center justify-between mb-3">
+                        <span
+                          className="text-[11px] font-semibold text-accent uppercase tracking-wide truncate max-w-[170px]"
+                          title={selectedBlock.text}
+                        >
+                          Chip: {selectedBlock.text}
+                        </span>
+                        <button
+                          className="text-[11px] text-text-dim hover:text-text hover:underline underline-offset-2 cursor-pointer"
+                          onClick={() => setSelectedBlockId(null)}
+                        >
+                          Done
+                        </button>
+                      </div>
+
+                      <div className="mb-3">
+                        <div className="flex items-center justify-between mb-1.5">
+                          <span className="text-[11px] text-text-dim">Text color</span>
+                          <button
+                            className="text-[11px] text-text-dim hover:text-text hover:underline underline-offset-2 cursor-pointer"
+                            onClick={handleResetBlockTextColor}
+                          >
+                            Use global
+                          </button>
+                        </div>
+                        <input
+                          type="color"
+                          value={selectedBlock.textColor || lyricColor}
+                          onChange={(e) => handleBlockTextColorChange(e.target.value)}
+                          className="w-8 h-8 rounded-md border border-white/10 bg-transparent p-0 cursor-pointer"
+                        />
+                      </div>
+
+                      <div className="mb-3">
+                        <div className="flex items-center justify-between mb-1.5">
+                          <span className="text-[11px] text-text-dim">Text effect</span>
+                          <button
+                            className="text-[11px] text-text-dim hover:text-text hover:underline underline-offset-2 cursor-pointer"
+                            onClick={handleResetBlockTextEffect}
+                          >
+                            Use global
+                          </button>
+                        </div>
+                        <select
+                          value={selectedBlock.textEffect || textEffect}
+                          onChange={(e) => handleBlockTextEffectChange(e.target.value)}
+                          className="w-full bg-panel-2 text-text border border-white/10 rounded-lg px-3 py-2 text-[13px] cursor-pointer focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent"
+                        >
+                          {TEXT_EFFECTS.map((effect) => (
+                            <option key={effect.id} value={effect.id}>{effect.label}</option>
+                          ))}
+                        </select>
+                      </div>
+
+                      <div>
+                        <div className="flex items-center justify-between mb-1.5">
+                          <span className="text-[11px] text-text-dim">Font</span>
+                          {selectedBlock.fontName && (
+                            <button
+                              className="text-[11px] text-text-dim hover:text-text hover:underline underline-offset-2 cursor-pointer"
+                              onClick={handleResetBlockFont}
+                            >
+                              Use global
+                            </button>
+                          )}
+                        </div>
+                        <label className={`${BTN_BASE} bg-panel-2 hover:bg-[#2E2136] w-full justify-center`}>
+                          <Type size={16} />
+                          <span className="truncate">{selectedBlock.fontName || 'Upload font for this chip'}</span>
+                          <input
+                            type="file"
+                            accept=".woff2,.woff,.ttf,.otf"
+                            onChange={handleBlockFontFile}
+                            className="hidden"
+                          />
+                        </label>
+                      </div>
+                    </div>
+                  )}
+
                   <div>
                     <div className="flex items-center justify-between mb-2">
                       <span className="text-[11px] font-semibold text-text-dim uppercase tracking-wide">Palette</span>
@@ -742,6 +921,28 @@ export default function LyricBloom() {
                   </div>
 
                   <div>
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="text-[11px] font-semibold text-text-dim uppercase tracking-wide">Text effect</span>
+                      <button
+                        className="text-[11px] text-text-dim hover:text-text hover:underline underline-offset-2 cursor-pointer"
+                        onClick={handleResetTextEffect}
+                      >
+                        Reset
+                      </button>
+                    </div>
+                    <select
+                      value={textEffect}
+                      onChange={(e) => setTextEffect(e.target.value)}
+                      className="w-full bg-panel-2 text-text border border-white/10 rounded-lg px-3 py-2 text-[13px] cursor-pointer focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent"
+                      title="WebGL shader applied to the active lyric text on Stage"
+                    >
+                      {TEXT_EFFECTS.map((effect) => (
+                        <option key={effect.id} value={effect.id}>{effect.label}</option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div>
                     <span className="text-[11px] font-semibold text-text-dim uppercase tracking-wide block mb-2">
                       Lyric font
                     </span>
@@ -783,6 +984,7 @@ export default function LyricBloom() {
         audioTimeRef={audioTimeRef}
         bassRef={bassRef}
         placedBlocksRef={placedBlocksRef}
+        placedBlocks={placedBlocks}
         particleShapeBuffer={glbBuffer}
         onShapeError={handleShapeError}
         fontBuffer={fontBuffer}
@@ -791,6 +993,7 @@ export default function LyricBloom() {
         textColor={lyricColor}
         textSize={lyricSize}
         particleSize={particleSize}
+        textEffect={textEffect}
       />
 
       <div className="flex gap-2.5 items-start">
@@ -856,7 +1059,7 @@ export default function LyricBloom() {
           {placedBlocks.map((block) => (
             <div
               key={block.id}
-              className="absolute top-2.5 h-[54px] rounded-md px-[18px] flex items-center cursor-grab active:cursor-grabbing shadow-[0_3px_10px_rgba(0,0,0,0.35)] min-w-[60px]"
+              className={`absolute top-2.5 h-[54px] rounded-md px-[18px] flex items-center cursor-grab active:cursor-grabbing shadow-[0_3px_10px_rgba(0,0,0,0.35)] min-w-[60px] ${block.id === selectedBlockId ? 'ring-2 ring-white' : ''}`}
               style={{
                 left: `${timeToX(block.start)}px`,
                 width: `${timeToX(block.duration)}px`,
@@ -864,7 +1067,7 @@ export default function LyricBloom() {
               }}
               onPointerDown={(e) => handleBlockPointerDown(e, block)}
               onDoubleClick={() => handleRemoveBlock(block)}
-              title="Drag to move · drag right edge to resize · double-click to remove"
+              title="Click to edit this chip's look · drag to move · drag right edge to resize · double-click to remove"
             >
               <span className="text-xs text-[#1A1120] font-semibold whitespace-nowrap overflow-hidden text-ellipsis">
                 {block.text}

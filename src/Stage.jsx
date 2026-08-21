@@ -2,7 +2,9 @@ import { useRef, useState, useEffect } from 'react';
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { FLORAL_PALETTE, DEFAULT_STAGE_COLORS, DEFAULT_LYRIC_COLOR, DEFAULT_LYRIC_SIZE, DEFAULT_PARTICLE_SIZE } from './lib/palette.js';
-import { loadCustomFont, CUSTOM_FONT_FAMILY } from './lib/font.js';
+import { loadCustomFont, CUSTOM_FONT_FAMILY, customFontFaceCss, blockFontFamily } from './lib/font.js';
+import { VFX } from '@vfx-js/core';
+import { DEFAULT_TEXT_EFFECT, getTextEffect } from './lib/textEffects.js';
 
 /* =========================================================================
    MODULE-LEVEL CONSTANTS & PURE HELPER FUNCTIONS
@@ -113,6 +115,7 @@ export default function Stage({
   audioTimeRef,
   bassRef,
   placedBlocksRef,
+  placedBlocks = [],
   particleShapeBuffer,
   onShapeError,
   fontBuffer,
@@ -122,26 +125,41 @@ export default function Stage({
   textSize = DEFAULT_LYRIC_SIZE,
   particleSize = DEFAULT_PARTICLE_SIZE,
   heightClassName = DEFAULT_HEIGHT_CLASSES,
+  textEffect = DEFAULT_TEXT_EFFECT,
 }) {
-  const [activeLyric, setActiveLyric] = useState('');
-  const activeLyricIdRef = useRef(null);
+  // The whole active placedBlocks entry (or null), not just its text — so a
+  // block's own textColor/textEffect/font overrides (see the "effective *"
+  // values below) travel with it as playback moves from block to block.
+  const [activeBlock, setActiveBlock] = useState(null);
+  const activeBlockIdRef = useRef(null);
   // Loaded independently of LyricBloom.jsx's own font load — each renders
   // into its own `document`, and a pop-out tab (StagePopout.jsx) needs its
   // own FontFace registration regardless of what the editor tab already did.
   const [fontLoaded, setFontLoaded] = useState(false);
+  // Same font, but as a self-contained @font-face rule — see customFontFaceCss.
+  const [fontFaceCss, setFontFaceCss] = useState('');
 
   useEffect(() => {
     let cancelled = false;
     const applyFont = async () => {
       if (!fontBuffer) {
-        if (!cancelled) setFontLoaded(false);
+        if (!cancelled) {
+          setFontLoaded(false);
+          setFontFaceCss('');
+        }
         return;
       }
       try {
         await loadCustomFont(fontBuffer);
-        if (!cancelled) setFontLoaded(true);
+        if (!cancelled) {
+          setFontLoaded(true);
+          setFontFaceCss(customFontFaceCss(fontBuffer));
+        }
       } catch {
-        if (!cancelled) setFontLoaded(false);
+        if (!cancelled) {
+          setFontLoaded(false);
+          setFontFaceCss('');
+        }
       }
     };
     applyFont();
@@ -149,6 +167,64 @@ export default function Stage({
       cancelled = true;
     };
   }, [fontBuffer]);
+
+  /* =======================================================================
+     PER-BLOCK FONTS — each placedBlocks entry can carry its own uploaded
+     font, distinct from the single global one above.
+     -----------------------------------------------------------------------
+     Keyed by block id rather than reloaded per-active-lyric: preloading
+     every block's font as soon as it's uploaded (instead of only when that
+     block becomes active) avoids a visible fallback-font flash the first
+     time playback reaches it. blockFontCacheRef tracks which ArrayBuffer is
+     currently loaded/loading for each id, so re-running this effect (it
+     fires on every placedBlocks change, including drag-reposition) doesn't
+     redundantly reload a font whose bytes haven't actually changed.
+     ======================================================================= */
+  const [blockFonts, setBlockFonts] = useState({}); // blockId -> { family, css }
+  const blockFontCacheRef = useRef(new Map()); // blockId -> the ArrayBuffer currently loaded/loading for it
+
+  useEffect(() => {
+    let cancelled = false;
+    // Drop cache entries for blocks that no longer exist, so re-adding a
+    // block that reuses a stale id later doesn't skip loading its font.
+    // (blockFonts state itself is left to accumulate — a removed block's
+    // entry there is simply never read again, since the animate loop below
+    // clears activeBlock to null within one frame of the block vanishing
+    // from placedBlocksRef.)
+    const liveIds = new Set(placedBlocks.map((b) => b.id));
+    for (const id of blockFontCacheRef.current.keys()) {
+      if (!liveIds.has(id)) blockFontCacheRef.current.delete(id);
+    }
+
+    placedBlocks.forEach((block) => {
+      if (!block.fontBuffer) return;
+      if (blockFontCacheRef.current.get(block.id) === block.fontBuffer) return; // already loaded this exact buffer
+
+      blockFontCacheRef.current.set(block.id, block.fontBuffer);
+      const family = blockFontFamily(block.id);
+      loadCustomFont(block.fontBuffer, family)
+        .then(() => {
+          if (cancelled || blockFontCacheRef.current.get(block.id) !== block.fontBuffer) return;
+          setBlockFonts((prev) => ({ ...prev, [block.id]: { family, css: customFontFaceCss(block.fontBuffer, family) } }));
+        })
+        .catch(() => {
+          // Leave this block without a font override — effectiveFontFamily
+          // below just falls back to the global font.
+        });
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [placedBlocks]);
+
+  // The currently-active block's own overrides win; anything it doesn't set
+  // falls back to the global settings passed in as props.
+  const activeBlockFont = activeBlock ? blockFonts[activeBlock.id] : null;
+  const effectiveTextColor = activeBlock?.textColor || textColor;
+  const effectiveTextEffect = activeBlock?.textEffect || textEffect;
+  const effectiveFontFamily = activeBlockFont ? activeBlockFont.family : (fontLoaded ? CUSTOM_FONT_FAMILY : null);
+  const effectiveFontFaceCss = activeBlockFont ? activeBlockFont.css : (fontLoaded ? fontFaceCss : '');
 
   const mountRef = useRef(null);       // div the Three.js canvas mounts into
   const rafRef = useRef(null);         // requestAnimationFrame id, for cleanup
@@ -159,6 +235,11 @@ export default function Stage({
   // points) so the palette-change effect below can rebuild particles without
   // needing to re-parse the .glb — it just re-reads whatever shape is live.
   const shapeGeometryRef = useRef(null);
+  // The sprite texture is a fixed radial-gradient glow with no dependency on
+  // palette/shape — created once and reused across every buildParticles()
+  // call instead of regenerating (and leaking) a new canvas+GPU texture on
+  // every palette tweak. See buildParticles below.
+  const particleTextureRef = useRef(null);
   // The animate loop below is set up once on mount (empty dependency array),
   // so it reads particleSize through this ref instead of the prop directly —
   // same "live mirror" trick as bassRef/audioTimeRef.
@@ -166,6 +247,54 @@ export default function Stage({
   useEffect(() => {
     particleSizeRef.current = particleSize;
   }, [particleSize]);
+  // Same live-mirror trick, but for the active block's effective text effect
+  // (global default, or that block's own override) — read by the mount
+  // effect below and the ref callback in the JSX, neither of which can read
+  // component state/props directly since they don't re-run on every render.
+  const effectiveTextEffectRef = useRef(effectiveTextEffect);
+  useEffect(() => {
+    effectiveTextEffectRef.current = effectiveTextEffect;
+  }, [effectiveTextEffect]);
+
+  const vfxRef = useRef(null);            // the shared VFX instance, created once in the setup effect
+  const vfxCanvasRef = useRef(null);      // vfx-js's own overlay <canvas>, captured so we can remove it ourselves — see setup effect
+  const vfxAttachedNodeRef = useRef(null); // DOM node currently holding a *resolved* vfx-js attachment, or null
+  const activeLyricNodeRef = useRef(null); // the (possibly empty-text) lyric div, kept live by the ref callback below
+  // vfx.add() is async (it snapshots the node to a canvas texture before
+  // registering it internally), so a call can still be in flight when a
+  // newer one supersedes it — e.g. the font finishes loading right as the
+  // effect picker changes. Each call stamps the generation it was issued
+  // at; when its promise resolves, it only claims vfxAttachedNodeRef if
+  // it's still current — otherwise it undoes its own vfx.add() so it
+  // doesn't linger as an orphaned shader layer nothing else points at.
+  const effectGenerationRef = useRef(0);
+
+  // Swaps whatever vfx-js attachment currently exists for `effectId` on `node`.
+  // Always removes before adding — vfx-js has no documented dispose(), so
+  // vfxAttachedNodeRef is how we track whether there's anything to remove at
+  // all, rather than relying on vfx.remove() being a safe no-op otherwise.
+  const applyTextEffect = (node, effectId) => {
+    const vfx = vfxRef.current;
+    if (!vfx) return;
+    const generation = ++effectGenerationRef.current;
+
+    if (vfxAttachedNodeRef.current) {
+      vfx.remove(vfxAttachedNodeRef.current);
+      vfxAttachedNodeRef.current = null;
+    }
+    if (!node) return;
+
+    const effect = getTextEffect(effectId);
+    if (!effect.shader) return;
+
+    vfx.add(node, { shader: effect.shader, overflow: effect.overflow }).then(() => {
+      if (generation !== effectGenerationRef.current) {
+        vfx.remove(node);
+        return;
+      }
+      vfxAttachedNodeRef.current = node;
+    });
+  };
 
   /* =======================================================================
      PARTICLE SYSTEM BUILDER
@@ -184,8 +313,17 @@ export default function Stage({
     const prev = particlesRef.current;
     if (prev) {
       scene.remove(prev.object3D);
-      prev.object3D.geometry.dispose();
+      // Custom-shape mode reuses the same geometry object (shapeGeometryRef)
+      // across rebuilds — disposing it here would free GPU buffers the new
+      // mesh below is about to reattach and reuse. Only dispose when this
+      // rebuild is actually switching to a different geometry.
+      if (prev.object3D.geometry !== shapeGeometry) {
+        prev.object3D.geometry.dispose();
+      }
       prev.object3D.material.dispose();
+    }
+    if (!particleTextureRef.current) {
+      particleTextureRef.current = createParticleTexture();
     }
 
     if (shapeGeometry) {
@@ -214,7 +352,7 @@ export default function Stage({
       geometry.setAttribute('color', new THREE.BufferAttribute(field.colors, 3));
       const material = new THREE.PointsMaterial({
         size: 0.14,
-        map: createParticleTexture(),
+        map: particleTextureRef.current,
         vertexColors: true,
         transparent: true,
         opacity: 0.85,
@@ -251,6 +389,22 @@ export default function Stage({
     mount.appendChild(renderer.domElement);
 
     sceneRef.current = scene;
+
+    // Same lifecycle spot as renderer/scene: created once on mount, torn
+    // down once on unmount. Whichever lyric div is already mounted (set by
+    // the ref callback below, which runs during commit — before this effect)
+    // gets its shader attached immediately after.
+    //
+    // vfx-js has no documented destroy(), but its constructor appends its
+    // own full-page overlay <canvas> straight to the DOM. Diff canvases
+    // before/after construction to capture that element ourselves — without
+    // this, StrictMode's dev-mode double-invoke (mount → cleanup → mount)
+    // orphans the first instance's canvas permanently, and you get two
+    // shader overlays stacked on top of each other.
+    const canvasesBefore = new Set(document.querySelectorAll('canvas'));
+    vfxRef.current = new VFX();
+    vfxCanvasRef.current = Array.from(document.querySelectorAll('canvas')).find((c) => !canvasesBefore.has(c)) || null;
+    applyTextEffect(activeLyricNodeRef.current, effectiveTextEffectRef.current);
 
     // Lighting only matters once a custom .glb shape is active — the default
     // sprite points are unlit (additive-blended glow texture) and ignore
@@ -313,9 +467,9 @@ export default function Stage({
       // Only touch React state when the active lyric actually changes —
       // cheap to check every frame, but only triggers a re-render on the
       // rare frame it matters.
-      if (activeId !== activeLyricIdRef.current) {
-        activeLyricIdRef.current = activeId;
-        setActiveLyric(active ? active.text : '');
+      if (activeId !== activeBlockIdRef.current) {
+        activeBlockIdRef.current = activeId;
+        setActiveBlock(active || null);
       }
 
       renderer.render(scene, camera);
@@ -342,6 +496,14 @@ export default function Stage({
         current.object3D.geometry.dispose();
         current.object3D.material.dispose();
       }
+      particleTextureRef.current?.dispose();
+      particleTextureRef.current = null;
+      // Remove the tracked shader attachment, then the overlay canvas itself
+      // (captured above) since vfx-js gives us no destroy() to do it for us.
+      applyTextEffect(null, null);
+      vfxRef.current = null;
+      vfxCanvasRef.current?.remove();
+      vfxCanvasRef.current = null;
       renderer.dispose();
       if (renderer.domElement.parentNode === mount) {
         mount.removeChild(renderer.domElement);
@@ -398,6 +560,17 @@ export default function Stage({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [palette]);
 
+  // Re-attach the shader when the effective effect/font changes (global
+  // settings, the active block's own override, or a block font finishing
+  // its load), but the lyric text itself doesn't change (so the div never
+  // remounts, and the ref callback below never re-fires on its own).
+  // Without effectiveFontFamily/effectiveFontFaceCss here, an effect
+  // attached before the font is ready bakes the fallback typeface into its
+  // shader texture permanently.
+  useEffect(() => {
+    applyTextEffect(activeLyricNodeRef.current, effectiveTextEffect);
+  }, [effectiveTextEffect, effectiveFontFamily, effectiveFontFaceCss]);
+
   return (
     <div
       className={`relative ${heightClassName} rounded-2xl overflow-hidden`}
@@ -405,16 +578,40 @@ export default function Stage({
     >
       <div ref={mountRef} className="absolute inset-0" />
       <div className="absolute inset-0 flex items-center justify-center pointer-events-none px-10">
-        <div
-          key={activeLyric}
-          className={`font-display font-semibold text-center [text-shadow:0_4px_24px_rgba(0,0,0,0.6)] opacity-0 ${activeLyric ? 'animate-fade-in-up' : ''}`}
-          style={{
-            color: textColor,
-            fontSize: `clamp(${Math.round(textSize / 2)}px, 4vw, ${textSize}px)`,
-            ...(fontLoaded ? { fontFamily: CUSTOM_FONT_FAMILY } : null),
-          }}
-        >
-          {activeLyric}
+        {/*
+          key={activeBlock?.id} means this wrapper fully remounts whenever the
+          active lyric block changes, restarting the fade-in animation and
+          re-firing the inner ref callback (null then node) so applyTextEffect
+          re-attaches, same remove-before-add sequence as buildParticles()
+          above.
+
+          The animation lives on this wrapper, not the vfx-js target below:
+          fadeInUp's `forwards` fill-mode permanently pins opacity:1 on
+          whatever element carries it, which would fight vfx-js's own
+          opacity:0 (used to hide the source node once its shader canvas is
+          ready) and leave the original text visible underneath the effect.
+        */}
+        <div key={activeBlock?.id ?? 'none'} className={`opacity-0 ${activeBlock ? 'animate-fade-in-up' : ''}`}>
+          <div
+            ref={(node) => {
+              activeLyricNodeRef.current = node;
+              applyTextEffect(node, effectiveTextEffectRef.current);
+            }}
+            className="font-display font-semibold text-center [text-shadow:0_4px_24px_rgba(0,0,0,0.6)]"
+            style={{
+              color: effectiveTextColor,
+              fontSize: `clamp(${Math.round(textSize / 2)}px, 4vw, ${textSize}px)`,
+              ...(effectiveFontFamily ? { fontFamily: effectiveFontFamily } : null),
+            }}
+          >
+            {/*
+              vfx-js snapshots this node into an isolated SVG image with no
+              access to document.fonts — embedding the font here too lets
+              that snapshot resolve the active font family as well.
+            */}
+            {effectiveFontFamily && effectiveFontFaceCss && <style>{effectiveFontFaceCss}</style>}
+            {activeBlock?.text ?? ''}
+          </div>
         </div>
       </div>
     </div>
