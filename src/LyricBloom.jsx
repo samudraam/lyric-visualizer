@@ -1,11 +1,14 @@
-import { useRef, useState, useEffect } from 'react';
-import { Play, Pause, Upload, Plus, Box, X, RotateCcw, Type, ExternalLink, Settings } from 'lucide-react';
+import { useRef, useState, useEffect, useMemo } from 'react';
+import { Play, Pause, Upload, Plus, Box, X, RotateCcw, Type, ExternalLink, Settings, LogIn, LogOut, Cloud, CloudOff, FilePlus } from 'lucide-react';
 import Stage from './Stage.jsx';
+import LyricFinder from './LyricFinder.jsx';
 import { FLORAL_PALETTE, DEFAULT_STAGE_COLORS, DEFAULT_LYRIC_COLOR, DEFAULT_LYRIC_SIZE, DEFAULT_PARTICLE_SIZE } from './lib/palette.js';
 import { loadCustomFont, CUSTOM_FONT_FAMILY } from './lib/font.js';
 import { STAGE_CHANNEL_NAME } from './lib/stageChannel.js';
 import { TEXT_EFFECTS, DEFAULT_TEXT_EFFECT } from './lib/textEffects.js';
 import { loadState, saveState } from './lib/persistence.js';
+import { signInWithGoogle, signOutUser } from './lib/firebase.js';
+import { useCloudMix } from './lib/useCloudMix.js';
 
 /* =========================================================================
    MODULE-LEVEL CONSTANTS & PURE HELPER FUNCTIONS
@@ -42,6 +45,18 @@ const BTN_BASE =
   'px-3.5 py-2 text-[13px] cursor-pointer transition-all duration-150 active:scale-[0.97] ' +
   'disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline ' +
   'focus-visible:outline-2 focus-visible:outline-accent focus-visible:outline-offset-2';
+
+// Shared classes for text inputs/selects (lyric finder, mix picker).
+const FIELD_BASE =
+  'bg-panel-2 text-text border border-white/10 rounded-lg px-3 py-2 text-[13px] ' +
+  'disabled:opacity-40 focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent';
+
+const SAVE_STATUS_TEXT = {
+  idle: 'Synced to your Google account',
+  saving: 'Saving…',
+  saved: 'Saved to your Google account',
+  error: 'Couldn\'t save. Changes are kept on this device only.',
+};
 
 export default function LyricBloom() {
   /* =======================================================================
@@ -80,8 +95,11 @@ export default function LyricBloom() {
   const [fontError, setFontError] = useState('');
   const [fontLoaded, setFontLoaded] = useState(false); // whether the uploaded font has finished loading in THIS document
 
+  const [authError, setAuthError] = useState('');
+
   const [showSettings, setShowSettings] = useState(false); // palette/stage-color/font settings menu
   const [selectedBlockId, setSelectedBlockId] = useState(null); // placed block currently shown in the settings menu's per-chip section
+  const [allSelected, setAllSelected] = useState(false); // "S" pressed: every placed block moves together when one is dragged
   const [palette, setPalette] = useState(savedState.palette ?? FLORAL_PALETTE);       // lyric-block + particle colors, editable in settings
   const [stageColors, setStageColors] = useState(savedState.stageColors ?? DEFAULT_STAGE_COLORS); // Stage's background gradient stops
   const [lyricColor, setLyricColor] = useState(savedState.lyricColor ?? DEFAULT_LYRIC_COLOR); // active-lyric text color on Stage
@@ -126,11 +144,32 @@ export default function LyricBloom() {
     placedBlocksRef.current = placedBlocks;
   }, [placedBlocks]);
 
-  // Persist lyrics/timeline + settings-menu state to localStorage on every
-  // change, so a reload picks up where this session left off (see the
-  // matching read in the savedState initializer above).
+  // Timeline shortcuts: S toggles "select all blocks" (drag any one to shift
+  // the whole song), Esc clears it. Ignored while typing in a field so "s"
+  // still types into the lyric/artist/title inputs.
   useEffect(() => {
-    saveState({
+    const onKeyDown = (e) => {
+      const t = e.target;
+      if (t.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(t.tagName)) return;
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      if (e.key === 's' || e.key === 'S') {
+        if (placedBlocksRef.current.length === 0) return;
+        e.preventDefault();
+        setAllSelected((v) => !v);
+      } else if (e.key === 'Escape') {
+        setAllSelected(false);
+      }
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, []);
+
+  // Everything that gets persisted: lyrics/timeline + settings-menu values.
+  // Saved to localStorage on every change, so a reload picks up where this
+  // session left off (see the matching read in the savedState initializer
+  // above), and to the open cloud mix when signed in (see useCloudMix).
+  const persistedState = useMemo(
+    () => ({
       lyricBank,
       // Persist each block's own overrides, but not its uploaded font bytes
       // — binary, and excluded for the same reason the global font upload
@@ -153,8 +192,33 @@ export default function LyricBloom() {
       lyricSize,
       particleSize,
       textEffect,
-    });
-  }, [lyricBank, placedBlocks, nextId, palette, stageColors, lyricColor, lyricSize, particleSize, textEffect]);
+    }),
+    [lyricBank, placedBlocks, nextId, palette, stageColors, lyricColor, lyricSize, particleSize, textEffect],
+  );
+
+  useEffect(() => {
+    saveState(persistedState);
+  }, [persistedState]);
+
+  // The inverse: load a persisted-state object (e.g. a cloud mix being
+  // opened) into the editor. Missing fields fall back to defaults, so `{}`
+  // gives a blank mix.
+  const applyPersistedState = (s) => {
+    setLyricBank(s.lyricBank ?? []);
+    setPlacedBlocks(s.placedBlocks ?? []);
+    setNextId(s.nextId ?? 1);
+    setPalette(s.palette ?? FLORAL_PALETTE);
+    setStageColors(s.stageColors ?? DEFAULT_STAGE_COLORS);
+    setLyricColor(s.lyricColor ?? DEFAULT_LYRIC_COLOR);
+    setLyricSize(s.lyricSize ?? DEFAULT_LYRIC_SIZE);
+    setParticleSize(s.particleSize ?? DEFAULT_PARTICLE_SIZE);
+    setTextEffect(s.textEffect ?? DEFAULT_TEXT_EFFECT);
+    setSelectedBlockId(null);
+    setAllSelected(false);
+  };
+
+  const { user, authReady, mixes, mixId, saveStatus, selectMix, newMix, nameMixIfUntitled } =
+    useCloudMix(persistedState, applyPersistedState);
 
   // Revoke the previous object URL when a new audio file is chosen, or on
   // unmount — object URLs hold a reference to the underlying file blob in
@@ -444,6 +508,11 @@ export default function LyricBloom() {
 
   // Opens the visualizer-only pop-out. A named window target means clicking
   // this again re-focuses the same tab instead of spawning duplicates.
+  const handleSignIn = () => {
+    setAuthError('');
+    signInWithGoogle().catch((err) => setAuthError(err.message));
+  };
+
   const openStagePopout = () => {
     window.open(`${window.location.pathname}?stage=1`, 'lyric-bloom-stage', 'width=960,height=600');
   };
@@ -451,13 +520,52 @@ export default function LyricBloom() {
   /* =======================================================================
      LYRIC BANK
      ======================================================================= */
-  const handleAddLyrics = () => {
-    const lines = lyricInput.split('\n').map((l) => l.trim()).filter(Boolean);
+  const addLinesToBank = (lines) => {
     if (lines.length === 0) return;
     const newItems = lines.map((text, i) => ({ id: nextId + i, text }));
     setLyricBank((prev) => [...prev, ...newItems]);
     setNextId((prev) => prev + lines.length);
+  };
+
+  const handleAddLyrics = () => {
+    addLinesToBank(lyricInput.split('\n').map((l) => l.trim()).filter(Boolean));
     setLyricInput('');
+  };
+
+  // Lyrics fetched by LyricFinder. Timestamped lyrics go straight onto the
+  // timeline, but only when it's empty; otherwise they'd pile on top of
+  // blocks already placed, so they go to the bank like plain lyrics do.
+  // Either way lines get fresh numeric ids from nextId (not the function's
+  // string ids) so they can't collide with existing blocks.
+  // Returns the message LyricFinder shows under the search row.
+  const handleLyricsFound = (song, { artist, title }) => {
+    nameMixIfUntitled(`${artist} – ${title}`);
+    const timed = song.timedLines ?? [];
+
+    if (timed.length && placedBlocks.length === 0) {
+      const blocks = timed.map((line, i) => ({
+        id: nextId + i,
+        text: line.text,
+        start: line.start,
+        duration: Math.max(0.3, line.duration),
+        color: palette[i % palette.length],
+      }));
+      setPlacedBlocks(blocks);
+      setNextId((prev) => prev + blocks.length);
+      // Without audio the track is only as long as the default duration, so
+      // stretch it to fit; loading audio later resets it to the file's
+      // length (see onLoadedMetadata).
+      if (!audioURL) {
+        const end = Math.max(...blocks.map((b) => b.start + b.duration));
+        setAudioDuration((prev) => Math.max(prev, Math.ceil(end)));
+      }
+      return `Placed ${blocks.length} timed lines on the timeline.`;
+    }
+
+    const lines = song.lyricBank.map((stub) => stub.text);
+    addLinesToBank(lines);
+    if (timed.length) return `Timeline isn't empty, so ${lines.length} lines went to the bank instead.`;
+    return `Added ${lines.length} lines to the bank. No timestamps were available for this song.`;
   };
 
 /* =======================================================================
@@ -562,11 +670,24 @@ export default function LyricBloom() {
     const startTime = block.start;
     let dragged = false;
 
+    // Group drag (after pressing S): snapshot every block's start so each
+    // move applies one shared offset, keeping their relative timing intact.
+    // The offset is clamped so the earliest block can't go before 0 and the
+    // latest can't run past the end of the audio.
+    const groupStarts = allSelected ? new Map(placedBlocks.map((b) => [b.id, b.start])) : null;
+    const minDelta = groupStarts ? -Math.min(...placedBlocks.map((b) => b.start)) : 0;
+    const maxDelta = groupStarts ? Math.max(0, audioDuration - Math.max(...placedBlocks.map((b) => b.start + b.duration))) : 0;
+
     const onMove = (ev) => {
       if (!dragged && (Math.abs(ev.clientX - startX) > CLICK_DRAG_THRESHOLD || Math.abs(ev.clientY - startY) > CLICK_DRAG_THRESHOLD)) {
         dragged = true;
       }
       const deltaTime = (ev.clientX - startX) / PIXELS_PER_SECOND;
+      if (groupStarts) {
+        const delta = clamp(deltaTime, minDelta, maxDelta);
+        setPlacedBlocks((prev) => prev.map((b) => (groupStarts.has(b.id) ? { ...b, start: groupStarts.get(b.id) + delta } : b)));
+        return;
+      }
       const newStart = clamp(startTime + deltaTime, 0, Math.max(0, audioDuration - block.duration));
       setPlacedBlocks((prev) => prev.map((b) => (b.id === block.id ? { ...b, start: newStart } : b)));
     };
@@ -574,6 +695,8 @@ export default function LyricBloom() {
       document.removeEventListener('pointermove', onMove);
       document.removeEventListener('pointerup', onUp);
       if (!dragged) {
+        // A plain click drops out of select-all and edits just this block.
+        setAllSelected(false);
         setSelectedBlockId(block.id);
         setShowSettings(true);
       }
@@ -976,8 +1099,49 @@ export default function LyricBloom() {
               </>
             )}
           </div>
+          {authReady && (user ? (
+            <div className="flex items-center gap-2">
+              <select
+                value={mixId ?? ''}
+                onChange={(e) => selectMix(e.target.value)}
+                className={`${FIELD_BASE} max-w-[200px] cursor-pointer`}
+                title="Your saved mixes"
+              >
+                {!mixId && <option value="">Loading mixes…</option>}
+                {mixes.map((m) => (
+                  <option key={m.id} value={m.id}>{m.title}</option>
+                ))}
+              </select>
+              <button
+                className={`${BTN_BASE} bg-panel-2 hover:bg-[#2E2136]`}
+                onClick={newMix}
+                title="Start a new blank mix"
+              >
+                <FilePlus size={16} />
+              </button>
+              <span className="text-text-dim" title={SAVE_STATUS_TEXT[saveStatus]}>
+                {saveStatus === 'error' ? <CloudOff size={16} className="text-[#E14F84]" /> : <Cloud size={16} className={saveStatus === 'saving' ? 'animate-pulse' : ''} />}
+              </span>
+              <button
+                className={`${BTN_BASE} bg-panel-2 hover:bg-[#2E2136]`}
+                onClick={signOutUser}
+                title={`Signed in as ${user.email}. Click to sign out.`}
+              >
+                {user.photoURL && (
+                  <img src={user.photoURL} alt="" referrerPolicy="no-referrer" className="w-4 h-4 rounded-full" />
+                )}
+                <LogOut size={16} />
+              </button>
+            </div>
+          ) : (
+            <button className={`${BTN_BASE} bg-panel-2 hover:bg-[#2E2136]`} onClick={handleSignIn}>
+              <LogIn size={16} />
+              <span>Sign in with Google</span>
+            </button>
+          ))}
         </div>
         {glbError && <div className="w-full text-xs text-[#E14F84] mt-1.5">{glbError}</div>}
+        {authError && <div className="w-full text-xs text-[#E14F84] mt-1.5">{authError}</div>}
       </header>
 
       <Stage
@@ -994,6 +1158,14 @@ export default function LyricBloom() {
         textSize={lyricSize}
         particleSize={particleSize}
         textEffect={textEffect}
+      />
+
+      <LyricFinder
+        user={user}
+        audioDuration={audioURL ? audioDuration : null}
+        inputClassName={FIELD_BASE}
+        buttonClassName={`${BTN_BASE} bg-panel-2 hover:bg-[#2E2136]`}
+        onFound={handleLyricsFound}
       />
 
       <div className="flex gap-2.5 items-start">
@@ -1047,6 +1219,7 @@ export default function LyricBloom() {
           ref={trackRef}
           className={`relative h-[74px] rounded-lg transition-colors duration-150 ${isDragOver ? 'bg-timeline-active' : 'bg-timeline'}`}
           style={{ width: `${timeToX(audioDuration)}px` }}
+          onPointerDown={(e) => { if (e.target === e.currentTarget) setAllSelected(false); }}
           onDragOver={(e) => { e.preventDefault(); setIsDragOver(true); }}
           onDragLeave={() => setIsDragOver(false)}
           onDrop={handleDrop}
@@ -1059,7 +1232,7 @@ export default function LyricBloom() {
           {placedBlocks.map((block) => (
             <div
               key={block.id}
-              className={`absolute top-2.5 h-[54px] rounded-md px-[18px] flex items-center cursor-grab active:cursor-grabbing shadow-[0_3px_10px_rgba(0,0,0,0.35)] min-w-[60px] ${block.id === selectedBlockId ? 'ring-2 ring-white' : ''}`}
+              className={`absolute top-2.5 h-[54px] rounded-md px-[18px] flex items-center cursor-grab active:cursor-grabbing shadow-[0_3px_10px_rgba(0,0,0,0.35)] min-w-[60px] ${allSelected || block.id === selectedBlockId ? 'ring-2 ring-white' : ''}`}
               style={{
                 left: `${timeToX(block.start)}px`,
                 width: `${timeToX(block.duration)}px`,
@@ -1080,7 +1253,9 @@ export default function LyricBloom() {
           ))}
         </div>
         <div className="text-[11px] text-text-dim mt-2">
-          Drag a chip onto the track · drag a placed block to move it · drag its right edge to resize · double-click to send it back to the bank
+          {allSelected
+            ? 'All blocks selected: drag any block to move them together · Esc or click the empty track to deselect'
+            : 'Drag a chip onto the track · drag a placed block to move it · drag its right edge to resize · double-click to send it back to the bank · press S to select all'}
         </div>
       </div>
 
