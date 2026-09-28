@@ -1,7 +1,8 @@
 import { useRef, useState, useEffect, useMemo } from 'react';
-import { Play, Pause, Upload, Plus, Box, X, RotateCcw, Type, ExternalLink, Settings, LogIn, LogOut, Cloud, CloudOff, FilePlus } from 'lucide-react';
+import { Play, Pause, Upload, Plus, Box, X, RotateCcw, Type, ExternalLink, Settings, LogIn, LogOut, Cloud, CloudOff, FilePlus, Layers } from 'lucide-react';
 import Stage from './Stage.jsx';
 import LyricFinder from './LyricFinder.jsx';
+import Knob from './Knob.jsx';
 import { FLORAL_PALETTE, DEFAULT_STAGE_COLORS, DEFAULT_LYRIC_COLOR, DEFAULT_LYRIC_SIZE, DEFAULT_PARTICLE_SIZE } from './lib/palette.js';
 import { loadCustomFont, CUSTOM_FONT_FAMILY } from './lib/font.js';
 import { STAGE_CHANNEL_NAME } from './lib/stageChannel.js';
@@ -46,6 +47,21 @@ const BTN_BASE =
   'disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline ' +
   'focus-visible:outline-2 focus-visible:outline-accent focus-visible:outline-offset-2';
 
+// Works out which of two chosen stem files is the vocals and which is the
+// background music, from their names. Demucs names them vocals.wav and
+// instrumental.wav (separation/separate.py) or no_vocals.wav (demucs CLI),
+// so the BGM pattern is checked first: "no_vocals" also contains "vocal".
+// Returns { vocals, bgm } Files, or null if the names don't say.
+const BGM_NAME = /no_vocals|instrumental|accompaniment|karaoke|bgm|backing|music/i;
+const VOCALS_NAME = /vocal|voice|acapella|a_cappella/i;
+function assignStemFiles([a, b]) {
+  const role = (f) => (BGM_NAME.test(f.name) ? 'bgm' : VOCALS_NAME.test(f.name) ? 'vocals' : null);
+  const [ra, rb] = [role(a), role(b)];
+  if (ra === 'vocals' || rb === 'bgm') return rb === 'vocals' ? null : { vocals: a, bgm: b };
+  if (ra === 'bgm' || rb === 'vocals') return { vocals: b, bgm: a };
+  return null;
+}
+
 // Shared classes for text inputs/selects (lyric finder, mix picker).
 const FIELD_BASE =
   'bg-panel-2 text-text border border-white/10 rounded-lg px-3 py-2 text-[13px] ' +
@@ -83,6 +99,12 @@ export default function LyricBloom() {
   const [audioURL, setAudioURL] = useState(null);
   const [audioName, setAudioName] = useState('');
   const [audioDuration, setAudioDuration] = useState(60); // seconds; refined once metadata loads
+  // Stems mode: the main <audio> plays the background music and a second,
+  // hidden <audio> plays the vocals in sync, each through its own dial.
+  const [stems, setStems] = useState(null); // null | { vocalsURL, vocalsName, bgmName }
+  const [stemsError, setStemsError] = useState('');
+  const [vocalsVolume, setVocalsVolume] = useState(savedState.vocalsVolume ?? 1); // gain, 1 = 100%
+  const [bgmVolume, setBgmVolume] = useState(savedState.bgmVolume ?? 1);
   const [isPlaying, setIsPlaying] = useState(false);
   const [isDragOver, setIsDragOver] = useState(false);
 
@@ -123,6 +145,9 @@ export default function LyricBloom() {
         you explicitly refresh a ref.
      ======================================================================= */
   const audioRef = useRef(null);
+  const vocalsAudioRef = useRef(null); // second <audio>, only has a src in stems mode
+  const mainGainRef = useRef(null);    // GainNode after audioRef (the BGM dial in stems mode)
+  const vocalsGainRef = useRef(null);  // GainNode after vocalsAudioRef (the vocals dial)
   const audioCtxRef = useRef(null);
   const analyserRef = useRef(null);
   const dataArrayRef = useRef(null);
@@ -209,8 +234,10 @@ export default function LyricBloom() {
       lyricSize,
       particleSize,
       textEffect,
+      vocalsVolume,
+      bgmVolume,
     }),
-    [lyricBank, placedBlocks, nextId, palette, stageColors, lyricColor, lyricSize, particleSize, textEffect],
+    [lyricBank, placedBlocks, nextId, palette, stageColors, lyricColor, lyricSize, particleSize, textEffect, vocalsVolume, bgmVolume],
   );
 
   useEffect(() => {
@@ -230,6 +257,8 @@ export default function LyricBloom() {
     setLyricSize(s.lyricSize ?? DEFAULT_LYRIC_SIZE);
     setParticleSize(s.particleSize ?? DEFAULT_PARTICLE_SIZE);
     setTextEffect(s.textEffect ?? DEFAULT_TEXT_EFFECT);
+    setVocalsVolume(s.vocalsVolume ?? 1);
+    setBgmVolume(s.bgmVolume ?? 1);
     setSelectedBlockId(null);
     setAllSelected(false);
   };
@@ -245,6 +274,20 @@ export default function LyricBloom() {
       if (audioURL) URL.revokeObjectURL(audioURL);
     };
   }, [audioURL]);
+
+  const vocalsURL = stems?.vocalsURL;
+  useEffect(() => {
+    return () => {
+      if (vocalsURL) URL.revokeObjectURL(vocalsURL);
+    };
+  }, [vocalsURL]);
+
+  // Dials → gain nodes. Outside stems mode the main track plays at full
+  // volume. (If the graph isn't built yet, ensureAudioGraph applies these.)
+  useEffect(() => {
+    if (mainGainRef.current) mainGainRef.current.gain.value = stems ? bgmVolume : 1;
+    if (vocalsGainRef.current) vocalsGainRef.current.gain.value = vocalsVolume;
+  }, [stems, bgmVolume, vocalsVolume]);
 
   /* =======================================================================
      POP-OUT SYNC — BroadcastChannel to the pop-out visualizer tab
@@ -368,6 +411,17 @@ export default function LyricBloom() {
         if (timeDisplayRef.current) {
           timeDisplayRef.current.textContent = `${formatTime(ct)} / ${formatTime(dur)}`;
         }
+
+        // Stems mode: the vocals element follows the main one. Checked every
+        // frame, so seeking, scrubbing and play/pause from anywhere stay in
+        // step; re-seeking only when they drift apart by more than 50 ms
+        // keeps it from stuttering over tiny scheduling differences.
+        const vocalsEl = vocalsAudioRef.current;
+        if (vocalsEl?.getAttribute('src') && ct < (vocalsEl.duration || Infinity)) {
+          if (Math.abs(vocalsEl.currentTime - ct) > 0.05) vocalsEl.currentTime = ct;
+          if (audioEl.paused && !vocalsEl.paused) vocalsEl.pause();
+          else if (!audioEl.paused && vocalsEl.paused) vocalsEl.play().catch(() => {});
+        }
       }
 
       channelRef.current?.postMessage({
@@ -392,15 +446,25 @@ export default function LyricBloom() {
     if (audioCtxRef.current) return; // already built — MediaElementSource can only be created ONCE per element
     const AudioContextClass = window.AudioContext || window.webkitAudioContext;
     const ctx = new AudioContextClass();
-    const source = ctx.createMediaElementSource(audioRef.current);
     const analyser = ctx.createAnalyser();
     analyser.fftSize = 256;
-    // Graph: <audio> → source → analyser → speakers.
+    // Graph: main <audio>   → gain (BGM dial)    ┐
+    //        vocals <audio> → gain (vocals dial) ┴→ analyser → speakers.
     // Routing through the analyser doesn't change what you hear; it just
-    // gives us a tap point to read frequency data from every frame.
-    source.connect(analyser);
+    // gives us a tap point to read frequency data from every frame. The
+    // vocals element is always wired up (it's silent without a src), since
+    // a MediaElementSource can't be added later for an element that
+    // already played outside the graph.
+    const mainGain = ctx.createGain();
+    mainGain.gain.value = stems ? bgmVolume : 1;
+    ctx.createMediaElementSource(audioRef.current).connect(mainGain).connect(analyser);
+    const vocalsGain = ctx.createGain();
+    vocalsGain.gain.value = vocalsVolume;
+    ctx.createMediaElementSource(vocalsAudioRef.current).connect(vocalsGain).connect(analyser);
     analyser.connect(ctx.destination);
 
+    mainGainRef.current = mainGain;
+    vocalsGainRef.current = vocalsGain;
     audioCtxRef.current = ctx;
     analyserRef.current = analyser;
     dataArrayRef.current = new Uint8Array(analyser.frequencyBinCount);
@@ -410,11 +474,16 @@ export default function LyricBloom() {
     if (!audioRef.current || !audioURL) return;
     ensureAudioGraph();
     if (audioCtxRef.current.state === 'suspended') audioCtxRef.current.resume();
+    const vocalsEl = stems ? vocalsAudioRef.current : null;
     if (isPlaying) {
       audioRef.current.pause();
+      vocalsEl?.pause();
       setIsPlaying(false);
     } else {
+      // The audio-sync loop lines the vocals up with the main track's
+      // position within a frame, so they don't need seeking here.
       audioRef.current.play();
+      vocalsEl?.play();
       setIsPlaying(true);
     }
   };
@@ -425,10 +494,38 @@ export default function LyricBloom() {
 
   const handleAudioFile = (e) => {
     const file = e.target.files[0];
+    e.target.value = '';
     if (!file) return;
-    if (audioURL) URL.revokeObjectURL(audioURL);
     setAudioURL(URL.createObjectURL(file));
     setAudioName(file.name);
+    setStems(null); // a single full-mix file replaces any loaded stems
+    setStemsError('');
+    setIsPlaying(false);
+  };
+
+  // Two files at once: a vocals stem and a background-music stem (e.g. the
+  // vocals.wav + instrumental.wav separation/separate.py produces). The BGM
+  // becomes the main track, so the timeline, seeking, duration and pop-out
+  // all keep working off audioRef unchanged; the vocals ride along in sync.
+  const handleStemFiles = (e) => {
+    const files = [...e.target.files];
+    e.target.value = '';
+    if (files.length === 0) return;
+    const assigned = files.length === 2 ? assignStemFiles(files) : null;
+    if (!assigned) {
+      setStemsError(
+        files.length !== 2
+          ? 'Choose exactly two files: a vocals stem and a background-music stem.'
+          : "Couldn't tell which file is which. Include \"vocals\" in one name and \"instrumental\" in the other."
+      );
+      return;
+    }
+    audioRef.current?.pause();
+    vocalsAudioRef.current?.pause();
+    setAudioURL(URL.createObjectURL(assigned.bgm));
+    setAudioName(`Stems: ${assigned.bgm.name.replace(/\.[^.]+$/, '')} + vocals`);
+    setStems({ vocalsURL: URL.createObjectURL(assigned.vocals), vocalsName: assigned.vocals.name, bgmName: assigned.bgm.name });
+    setStemsError('');
     setIsPlaying(false);
   };
 
@@ -803,6 +900,14 @@ export default function LyricBloom() {
             <span>{audioName || 'Upload audio'}</span>
             <input type="file" accept="audio/*" onChange={handleAudioFile} className="hidden" />
           </label>
+          <label
+            className={`${BTN_BASE} bg-panel-2 hover:bg-[#2E2136]`}
+            title="Load a vocals file and an instrumental file together (e.g. from separation/separate.py) to mix them with dials"
+          >
+            <Layers size={16} />
+            <span>Load stems</span>
+            <input type="file" accept="audio/*" multiple onChange={handleStemFiles} className="hidden" />
+          </label>
           <button
             className={`${BTN_BASE} border-none bg-gradient-to-br from-[#E14F84] to-[#F2A93B]`}
             onClick={togglePlay}
@@ -1164,7 +1269,22 @@ export default function LyricBloom() {
         </div>
         {glbError && <div className="w-full text-xs text-[#E14F84] mt-1.5">{glbError}</div>}
         {authError && <div className="w-full text-xs text-[#E14F84] mt-1.5">{authError}</div>}
+        {stemsError && <div className="w-full text-xs text-[#E14F84] mt-1.5">{stemsError}</div>}
       </header>
+
+      {stems && (
+        <div className="flex items-center gap-5 flex-wrap bg-panel rounded-xl px-4 py-2.5">
+          <span className="flex items-center gap-2 text-xs text-text-dim">
+            <Layers size={14} />
+            Mixer
+          </span>
+          <Knob label="Vocals" value={vocalsVolume} onChange={setVocalsVolume} color={palette[1]} />
+          <Knob label="BGM" value={bgmVolume} onChange={setBgmVolume} color={palette[0]} />
+          <span className="text-[11px] text-text-dim truncate min-w-0 flex-1" title={`${stems.vocalsName} + ${stems.bgmName}`}>
+            {stems.vocalsName} + {stems.bgmName}
+          </span>
+        </div>
+      )}
 
       <Stage
         audioTimeRef={audioTimeRef}
@@ -1285,9 +1405,13 @@ export default function LyricBloom() {
         ref={audioRef}
         src={audioURL || undefined}
         onLoadedMetadata={() => setAudioDuration(audioRef.current.duration || 60)}
-        onEnded={() => setIsPlaying(false)}
+        onEnded={() => {
+          vocalsAudioRef.current?.pause();
+          setIsPlaying(false);
+        }}
         className="hidden"
       />
+      <audio ref={vocalsAudioRef} src={stems?.vocalsURL || undefined} preload="auto" className="hidden" />
     </div>
   );
 }

@@ -1,0 +1,4 @@
+# Demucs pulls in PyTorch; on Apple Silicon the default wheel includes MPS
+# (Mac GPU) support, on Linux/Windows install a CUDA build of torch first
+# for NVIDIA GPUs: https://pytorch.org/get-started/locally/
+demucs==4.1.0
