@@ -144,15 +144,24 @@ export default function LyricBloom() {
     placedBlocksRef.current = placedBlocks;
   }, [placedBlocks]);
 
-  // Timeline shortcuts: S toggles "select all blocks" (drag any one to shift
-  // the whole song), Esc clears it. Ignored while typing in a field so "s"
-  // still types into the lyric/artist/title inputs.
+  // Keyboard shortcuts: Space plays/pauses, S toggles "select all blocks"
+  // (drag any one to shift the whole song), Esc clears it. Ignored while
+  // typing in a field so Space and "s" still type into the lyric/artist/
+  // title inputs.
+  // togglePlay is re-created every render (it reads isPlaying/audioURL), so
+  // this once-registered listener calls it through a ref kept current below.
+  const togglePlayRef = useRef(null);
   useEffect(() => {
+    const isTyping = (t) => t.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(t.tagName);
     const onKeyDown = (e) => {
-      const t = e.target;
-      if (t.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(t.tagName)) return;
+      if (isTyping(e.target)) return;
       if (e.metaKey || e.ctrlKey || e.altKey) return;
-      if (e.key === 's' || e.key === 'S') {
+      if (e.code === 'Space') {
+        // Also stops the page scrolling and, if a button has focus (e.g. Play
+        // itself, after being clicked), stops Space from clicking it too.
+        e.preventDefault();
+        if (!e.repeat) togglePlayRef.current?.();
+      } else if (e.key === 's' || e.key === 'S') {
         if (placedBlocksRef.current.length === 0) return;
         e.preventDefault();
         setAllSelected((v) => !v);
@@ -160,8 +169,16 @@ export default function LyricBloom() {
         setAllSelected(false);
       }
     };
+    // Browsers "click" a focused button on Space *keyup*, so block that too.
+    const onKeyUp = (e) => {
+      if (e.code === 'Space' && !isTyping(e.target)) e.preventDefault();
+    };
     document.addEventListener('keydown', onKeyDown);
-    return () => document.removeEventListener('keydown', onKeyDown);
+    document.addEventListener('keyup', onKeyUp);
+    return () => {
+      document.removeEventListener('keydown', onKeyDown);
+      document.removeEventListener('keyup', onKeyUp);
+    };
   }, []);
 
   // Everything that gets persisted: lyrics/timeline + settings-menu values.
@@ -401,6 +418,10 @@ export default function LyricBloom() {
       setIsPlaying(true);
     }
   };
+
+  useEffect(() => {
+    togglePlayRef.current = togglePlay;
+  });
 
   const handleAudioFile = (e) => {
     const file = e.target.files[0];
@@ -786,6 +807,7 @@ export default function LyricBloom() {
             className={`${BTN_BASE} border-none bg-gradient-to-br from-[#E14F84] to-[#F2A93B]`}
             onClick={togglePlay}
             disabled={!audioURL}
+            title="Play/pause (Space)"
           >
             {isPlaying ? <Pause size={16} /> : <Play size={16} />}
             <span>{isPlaying ? 'Pause' : 'Play'}</span>
