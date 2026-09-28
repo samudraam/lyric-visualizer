@@ -1,0 +1,13 @@
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+    // Audio, fonts and particle shapes live under users/{uid}/…
+    // Uploads are capped at 50 MB.
+    match /users/{uid}/{allPaths=**} {
+      allow read: if request.auth != null && request.auth.uid == uid;
+      allow write: if request.auth != null && request.auth.uid == uid
+                   && (request.resource == null || request.resource.size < 50 * 1024 * 1024);
+    }
+  }
+}
