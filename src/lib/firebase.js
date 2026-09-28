@@ -1,20 +1,29 @@
 // Firebase app + the services the editor uses (Auth, Firestore).
 //
-// This web config is safe to commit: it only identifies the project. What a
-// client can actually read/write is enforced by firestore.rules /
-// storage.rules, not by keeping these values secret.
+// The web config comes from Vite env vars (see .env.example; real values
+// live in the untracked .env.local). Note that Vite inlines VITE_* values
+// into the browser bundle, so this keeps the key out of git, not out of the
+// shipped site. What protects data is firestore.rules / storage.rules plus
+// the key's website + API restrictions in Google Cloud. Never put a real
+// server secret in a VITE_ variable; use Cloud Functions secrets instead.
 import { initializeApp } from 'firebase/app';
 import { getAuth, GoogleAuthProvider, signInWithPopup, signOut, connectAuthEmulator } from 'firebase/auth';
 import { initializeFirestore, connectFirestoreEmulator } from 'firebase/firestore';
 
 const firebaseConfig = {
-  apiKey: 'AIzaSyD6l6ziSDODaeSCnCLAMvGNV1s3wOUHnTg',
-  authDomain: 'lyric-bloom.firebaseapp.com',
-  projectId: 'lyric-bloom',
-  storageBucket: 'lyric-bloom.firebasestorage.app',
-  messagingSenderId: '361284680008',
-  appId: '1:361284680008:web:3123971c9494dbf0fedb7d',
+  apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
+  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
+  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID,
+  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET,
+  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
+  appId: import.meta.env.VITE_FIREBASE_APP_ID,
 };
+
+// Fail loudly on a fresh clone instead of with a cryptic Firebase error.
+const missing = Object.entries(firebaseConfig).filter(([, v]) => !v).map(([k]) => k);
+if (missing.length) {
+  throw new Error(`Missing Firebase config (${missing.join(', ')}). Copy .env.example to .env.local and fill it in.`);
+}
 
 const app = initializeApp(firebaseConfig);
 

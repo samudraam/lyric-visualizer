@@ -29,3 +29,8 @@ firebase-debug.log
 firebase-debug.*.log
 firestore-debug.log
 ui-debug.log
+
+# Env files (keep .env.example committed)
+.env
+.env.*
+!.env.example

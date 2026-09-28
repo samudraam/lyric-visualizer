@@ -56,8 +56,11 @@ Shortcuts are ignored while you're typing in a text field.
 
 ```bash
 npm install
-npm run dev        # http://localhost:5173
+cp .env.example .env.local   # then set VITE_FIREBASE_API_KEY (see below)
+npm run dev                  # http://localhost:5173
 ```
+
+The Firebase web config is read from `VITE_FIREBASE_*` variables in `.env.local`, which is gitignored. Get the values from Firebase console → Project settings → Your apps, or with `firebase apps:sdkconfig WEB`. The app shows an error naming any missing values. The API key is the restricted one, with website and API restrictions set in Google Cloud. Real server secrets never go in `VITE_` variables; they belong in Cloud Functions secrets.
 
 The app runs against the live Firebase project (`lyric-bloom`) by default. To use local emulators instead:
 
