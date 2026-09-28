@@ -47,6 +47,23 @@ def audio_seconds(wav: torch.Tensor, samplerate: int) -> float:
     return wav.shape[-1] / samplerate
 
 
+def mix_outputs(stems: dict, all_stems: bool) -> dict:
+    """Turn Demucs's per-source stems into the files we save.
+
+    The instrumental is every non-vocal stem summed back together. Because
+    the model is trained so its stems add up to the mix, this is close to
+    (mix - vocals) but avoids any phase leftovers from subtracting.
+    Shared with worker.py (the Cloud Run job).
+    """
+    outputs = {
+        "vocals": stems["vocals"],
+        "instrumental": sum(wav for name, wav in stems.items() if name != "vocals"),
+    }
+    if all_stems:
+        outputs.update({name: wav for name, wav in stems.items() if name != "vocals"})
+    return outputs
+
+
 def separate_file(separator: Separator, path: Path, out_root: Path, all_stems: bool, fmt: str) -> None:
     started = time.perf_counter()
     # `mix` is the input resampled to the model's rate (44.1 kHz stereo);
@@ -57,17 +74,7 @@ def separate_file(separator: Separator, path: Path, out_root: Path, all_stems: b
     out_dir = out_root / path.stem
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # The instrumental is every non-vocal stem summed back together. Because
-    # the model is trained so its stems add up to the mix, this is close to
-    # (mix - vocals) but avoids any phase leftovers from subtracting.
-    outputs = {
-        "vocals": stems["vocals"],
-        "instrumental": sum(wav for name, wav in stems.items() if name != "vocals"),
-    }
-    if all_stems:
-        outputs.update({name: wav for name, wav in stems.items() if name != "vocals"})
-
-    for name, wav in outputs.items():
+    for name, wav in mix_outputs(stems, all_stems).items():
         # save_audio rescales if a stem would clip, so peaks don't distort.
         save_audio(wav.cpu(), out_dir / f"{name}.{fmt}", samplerate=separator.samplerate)
 

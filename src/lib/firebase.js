@@ -1,4 +1,4 @@
-// Firebase app + the services the editor uses (Auth, Firestore).
+// Firebase app + the services the editor uses (Auth, Firestore, Storage).
 //
 // The web config comes from Vite env vars (see .env.example; real values
 // live in the untracked .env.local). Note that Vite inlines VITE_* values
@@ -9,6 +9,7 @@
 import { initializeApp } from 'firebase/app';
 import { getAuth, GoogleAuthProvider, signInWithPopup, signOut, connectAuthEmulator } from 'firebase/auth';
 import { initializeFirestore, connectFirestoreEmulator } from 'firebase/firestore';
+import { getStorage, connectStorageEmulator } from 'firebase/storage';
 
 const firebaseConfig = {
   apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
@@ -36,11 +37,15 @@ export const auth = getAuth(app);
 // match firebase.json and DATABASE_ID in functions/index.js.
 export const db = initializeFirestore(app, { ignoreUndefinedProperties: true }, 'lyricbloom');
 
+// Song uploads and separated stems (see cloudSeparations.js).
+export const storage = getStorage(app);
+
 // `VITE_USE_EMULATORS=true npm run dev` points the app at
 // `firebase emulators:start` instead of the live project.
 if (import.meta.env.VITE_USE_EMULATORS === 'true') {
   connectAuthEmulator(auth, 'http://127.0.0.1:9099', { disableWarnings: true });
   connectFirestoreEmulator(db, '127.0.0.1', 8080);
+  connectStorageEmulator(storage, '127.0.0.1', 9199);
 }
 
 const googleProvider = new GoogleAuthProvider();

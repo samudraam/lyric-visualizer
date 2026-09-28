@@ -1,0 +1,9 @@
+# Files Cloud Build doesn't need when building the job image.
+.venv/
+separated/
+__pycache__/
+*.wav
+*.mp3
+*.flac
+*.png
+README.md

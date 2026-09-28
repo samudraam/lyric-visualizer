@@ -1,5 +1,5 @@
 import { useRef, useState, useEffect, useMemo } from 'react';
-import { Play, Pause, Upload, Plus, Box, X, RotateCcw, Type, ExternalLink, Settings, LogIn, LogOut, Cloud, CloudOff, FilePlus, Layers } from 'lucide-react';
+import { Play, Pause, Upload, Plus, Box, X, RotateCcw, Type, ExternalLink, Settings, LogIn, LogOut, Cloud, CloudOff, FilePlus, Layers, AudioLines, FolderOpen } from 'lucide-react';
 import Stage from './Stage.jsx';
 import LyricFinder from './LyricFinder.jsx';
 import Knob from './Knob.jsx';
@@ -10,6 +10,8 @@ import { TEXT_EFFECTS, DEFAULT_TEXT_EFFECT } from './lib/textEffects.js';
 import { loadState, saveState } from './lib/persistence.js';
 import { signInWithGoogle, signOutUser } from './lib/firebase.js';
 import { useCloudMix } from './lib/useCloudMix.js';
+import { useCloudSeparation } from './lib/useCloudSeparation.js';
+import { getSeparation, downloadStems, watchReadySeparations } from './lib/cloudSeparations.js';
 
 /* =========================================================================
    MODULE-LEVEL CONSTANTS & PURE HELPER FUNCTIONS
@@ -98,11 +100,17 @@ export default function LyricBloom() {
 
   const [audioURL, setAudioURL] = useState(null);
   const [audioName, setAudioName] = useState('');
+  const [audioFile, setAudioFile] = useState(null); // the full-mix File from "Upload audio" (for cloud separation)
   const [audioDuration, setAudioDuration] = useState(60); // seconds; refined once metadata loads
   // Stems mode: the main <audio> plays the background music and a second,
   // hidden <audio> plays the vocals in sync, each through its own dial.
-  const [stems, setStems] = useState(null); // null | { vocalsURL, vocalsName, bgmName }
+  const [stems, setStems] = useState(null); // null | { vocalsURL, vocalsName, bgmName, separationId }
   const [stemsError, setStemsError] = useState('');
+  // The saved cloud separation this mix uses, so reopening the mix (or
+  // reloading the page) loads its stems again without re-running the job.
+  const [stemsSeparationId, setStemsSeparationId] = useState(savedState.stemsSeparationId ?? null);
+  const [stemsLoading, setStemsLoading] = useState(''); // file name while saved stems download
+  const [showSavedStems, setShowSavedStems] = useState(false);
   const [vocalsVolume, setVocalsVolume] = useState(savedState.vocalsVolume ?? 1); // gain, 1 = 100%
   const [bgmVolume, setBgmVolume] = useState(savedState.bgmVolume ?? 1);
   const [isPlaying, setIsPlaying] = useState(false);
@@ -236,8 +244,9 @@ export default function LyricBloom() {
       textEffect,
       vocalsVolume,
       bgmVolume,
+      stemsSeparationId,
     }),
-    [lyricBank, placedBlocks, nextId, palette, stageColors, lyricColor, lyricSize, particleSize, textEffect, vocalsVolume, bgmVolume],
+    [lyricBank, placedBlocks, nextId, palette, stageColors, lyricColor, lyricSize, particleSize, textEffect, vocalsVolume, bgmVolume, stemsSeparationId],
   );
 
   useEffect(() => {
@@ -259,6 +268,9 @@ export default function LyricBloom() {
     setTextEffect(s.textEffect ?? DEFAULT_TEXT_EFFECT);
     setVocalsVolume(s.vocalsVolume ?? 1);
     setBgmVolume(s.bgmVolume ?? 1);
+    // A mix without saved stems keeps whatever audio is loaded, same as
+    // before stems existed; one with them loads them (see the effect below).
+    if (s.stemsSeparationId) setStemsSeparationId(s.stemsSeparationId);
     setSelectedBlockId(null);
     setAllSelected(false);
   };
@@ -498,7 +510,9 @@ export default function LyricBloom() {
     if (!file) return;
     setAudioURL(URL.createObjectURL(file));
     setAudioName(file.name);
+    setAudioFile(file);
     setStems(null); // a single full-mix file replaces any loaded stems
+    setStemsSeparationId(null);
     setStemsError('');
     setIsPlaying(false);
   };
@@ -520,14 +534,78 @@ export default function LyricBloom() {
       );
       return;
     }
+    setAudioFile(null);
+    applyStems(assigned.vocals, assigned.bgm, assigned.vocals.name, assigned.bgm.name,
+      `Stems: ${assigned.bgm.name.replace(/\.[^.]+$/, '')} + vocals`);
+  };
+
+  // Loads a vocals + BGM pair (Files or downloaded Blobs) into stems mode.
+  // separationId is set when they came from a saved cloud separation, so
+  // the mix remembers them; local files leave it null.
+  const applyStems = (vocalsBlob, bgmBlob, vocalsName, bgmName, label, separationId = null) => {
     audioRef.current?.pause();
     vocalsAudioRef.current?.pause();
-    setAudioURL(URL.createObjectURL(assigned.bgm));
-    setAudioName(`Stems: ${assigned.bgm.name.replace(/\.[^.]+$/, '')} + vocals`);
-    setStems({ vocalsURL: URL.createObjectURL(assigned.vocals), vocalsName: assigned.vocals.name, bgmName: assigned.bgm.name });
+    setAudioURL(URL.createObjectURL(bgmBlob));
+    setAudioName(label);
+    setStems({ vocalsURL: URL.createObjectURL(vocalsBlob), vocalsName, bgmName, separationId });
+    setStemsSeparationId(separationId);
     setStemsError('');
     setIsPlaying(false);
   };
+
+  const applyCloudStems = (blobs, sep) => {
+    const base = (sep.fileName ?? 'song').replace(/\.[^.]+$/, '');
+    applyStems(blobs.vocals, blobs.instrumental, `${base} (vocals).mp3`, `${base} (instrumental).mp3`, `Stems: ${base}`, sep.id);
+  };
+
+  // Cloud separation (Split vocals): when the job's stems arrive (or saved
+  // ones for the same file are found), load them into the mixer, but only
+  // if that song is still the one loaded; if the user has moved on to
+  // another file, leave the editor alone.
+  const separation = useCloudSeparation(user, (blobs, { file, separation: sep }) => {
+    if (file !== audioFile) return;
+    setAudioFile(null);
+    applyCloudStems(blobs, sep);
+  });
+
+  // Saved stems: download a finished separation's files and load them. No
+  // job runs; the stems are already in Storage.
+  const loadSavedStems = async (sep) => {
+    setShowSavedStems(false);
+    setStemsLoading(sep.fileName ?? 'saved stems');
+    try {
+      const blobs = await downloadStems(sep);
+      setAudioFile(null);
+      applyCloudStems(blobs, sep);
+    } catch (err) {
+      setStemsError(`Couldn't load the saved stems: ${err.message}`);
+    } finally {
+      setStemsLoading('');
+    }
+  };
+
+  // Reopening a mix (or reloading) whose stems aren't loaded yet: fetch
+  // them. Runs through a ref so the effect only re-runs when the ids change.
+  const loadSavedStemsRef = useRef(loadSavedStems);
+  useEffect(() => {
+    loadSavedStemsRef.current = loadSavedStems;
+  });
+  const uid = user?.uid;
+  const loadedSeparationId = stems?.separationId ?? null;
+  useEffect(() => {
+    if (!uid || !stemsSeparationId || loadedSeparationId === stemsSeparationId) return;
+    let cancelled = false;
+    getSeparation(uid, stemsSeparationId)
+      .then((sep) => {
+        if (cancelled) return;
+        if (sep?.status === 'ready') loadSavedStemsRef.current(sep);
+        else setStemsSeparationId(null); // deleted, or never finished
+      })
+      .catch((err) => !cancelled && setStemsError(`Couldn't find this mix's saved stems: ${err.message}`));
+    return () => {
+      cancelled = true;
+    };
+  }, [uid, stemsSeparationId, loadedSeparationId]);
 
   /* =======================================================================
      CUSTOM PARTICLE SHAPE (.glb upload)
@@ -908,6 +986,38 @@ export default function LyricBloom() {
             <span>Load stems</span>
             <input type="file" accept="audio/*" multiple onChange={handleStemFiles} className="hidden" />
           </label>
+          {user && audioFile && !stems && (
+            <button
+              className={`${BTN_BASE} bg-panel-2 hover:bg-[#2E2136]`}
+              onClick={() => separation.start(audioFile)}
+              disabled={separation.busy}
+              title="Separate this song into vocals and instrumental on Google Cloud, then load them into the mixer"
+            >
+              <AudioLines size={16} />
+              <span>Split vocals</span>
+            </button>
+          )}
+          {user && (
+            <div className="relative">
+              <button
+                className={`${BTN_BASE} bg-panel-2 hover:bg-[#2E2136]`}
+                onClick={() => setShowSavedStems((v) => !v)}
+                aria-expanded={showSavedStems}
+                title="Load stems you've already separated in the cloud (no re-processing)"
+              >
+                <FolderOpen size={16} />
+                <span>Saved stems</span>
+              </button>
+              {showSavedStems && (
+                <SavedStemsMenu
+                  uid={user.uid}
+                  currentId={loadedSeparationId}
+                  onPick={loadSavedStems}
+                  onClose={() => setShowSavedStems(false)}
+                />
+              )}
+            </div>
+          )}
           <button
             className={`${BTN_BASE} border-none bg-gradient-to-br from-[#E14F84] to-[#F2A93B]`}
             onClick={togglePlay}
@@ -1270,6 +1380,8 @@ export default function LyricBloom() {
         {glbError && <div className="w-full text-xs text-[#E14F84] mt-1.5">{glbError}</div>}
         {authError && <div className="w-full text-xs text-[#E14F84] mt-1.5">{authError}</div>}
         {stemsError && <div className="w-full text-xs text-[#E14F84] mt-1.5">{stemsError}</div>}
+        {separation.job && <SeparationStatus job={separation.job} onDismiss={separation.dismiss} />}
+        {stemsLoading && <div className="w-full text-xs text-text-dim mt-1.5">Loading saved stems for {stemsLoading}…</div>}
       </header>
 
       {stems && (
@@ -1413,5 +1525,80 @@ export default function LyricBloom() {
       />
       <audio ref={vocalsAudioRef} src={stems?.vocalsURL || undefined} preload="auto" className="hidden" />
     </div>
+  );
+}
+
+// One-line status for a cloud separation, with a progress bar while
+// uploading or separating. Cold starts (container + model load) show as
+// "running" at 0% for the first half-minute or so.
+function SeparationStatus({ job, onDismiss }) {
+  const pct = Math.round((job.progress ?? 0) * 100);
+  const text = {
+    checking: 'Checking for saved stems of this song…',
+    uploading: `Uploading ${job.fileName}… ${pct}%`,
+    queued: 'Starting a separation job on Google Cloud…',
+    starting: 'Starting a separation job on Google Cloud…',
+    running: pct > 0 ? `Separating vocals on Google Cloud… ${pct}%` : 'Separating vocals on Google Cloud (loading the model)…',
+    downloading: 'Downloading the stems…',
+    done: job.reused
+      ? 'Found saved stems for this song, loaded into the mixer (no re-processing).'
+      : `Stems ready${job.processingSeconds ? ` (processed in ${Math.round(job.processingSeconds)} s)` : ''}, loaded into the mixer.`,
+    error: job.error,
+  }[job.phase];
+  const showBar = job.phase === 'uploading' || job.phase === 'running';
+
+  return (
+    <div className="w-full flex items-center gap-3 mt-1.5 text-xs">
+      <span className={job.phase === 'error' ? 'text-[#E14F84]' : 'text-text-dim'}>{text}</span>
+      {showBar && (
+        <div className="h-1 w-40 rounded-full bg-white/10 overflow-hidden">
+          <div className="h-full bg-accent transition-[width] duration-300" style={{ width: `${pct}%` }} />
+        </div>
+      )}
+      {(job.phase === 'done' || job.phase === 'error') && (
+        <button className="text-text-dim hover:text-text cursor-pointer" onClick={onDismiss} title="Dismiss">
+          <X size={12} />
+        </button>
+      )}
+    </div>
+  );
+}
+
+// Dropdown of the user's finished cloud separations. Picking one downloads
+// its stems from Storage; nothing is re-processed.
+function SavedStemsMenu({ uid, currentId, onPick, onClose }) {
+  const [items, setItems] = useState(null); // null while loading
+  const [error, setError] = useState('');
+
+  useEffect(
+    () => watchReadySeparations(uid, setItems, (err) => setError(err.message)),
+    [uid],
+  );
+
+  const formatDate = (ts) => (ts?.toDate ? ts.toDate().toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) : '');
+
+  return (
+    <>
+      <div className="fixed inset-0 z-40" onClick={onClose} />
+      <div className="absolute right-0 top-full mt-2 z-50 w-80 max-h-80 overflow-y-auto bg-panel border border-white/10 rounded-xl p-2 shadow-[0_8px_30px_rgba(0,0,0,0.5)] text-left">
+        {error && <div className="text-xs text-[#E14F84] p-2">{error}</div>}
+        {!error && items === null && <div className="text-xs text-text-dim p-2">Loading…</div>}
+        {!error && items?.length === 0 && (
+          <div className="text-xs text-text-dim p-2">No saved stems yet. Load a song and click Split vocals.</div>
+        )}
+        {items?.map((sep) => (
+          <button
+            key={sep.id}
+            className={`w-full flex items-center justify-between gap-3 rounded-lg px-3 py-2 text-left text-[13px] cursor-pointer hover:bg-panel-2 ${sep.id === currentId ? 'bg-panel-2' : ''}`}
+            onClick={() => onPick(sep)}
+          >
+            <span className="truncate">{sep.fileName ?? 'Untitled'}</span>
+            <span className="shrink-0 text-[11px] text-text-dim tabular-nums">
+              {sep.id === currentId ? 'loaded' : [sep.durationSeconds ? formatTime(sep.durationSeconds) : '', formatDate(sep.createdAt)].filter(Boolean).join(' · ')}
+            </span>
+          </button>
+        ))}
+      </div>
+    </>
   );
 }

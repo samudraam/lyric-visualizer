@@ -1,0 +1,7 @@
+# Installed by the Dockerfile on top of CPU-only torch.
+demucs==4.1.0
+# Demucs imports numpy but doesn't declare it, and CPU-only torch doesn't
+# pull it in either.
+numpy
+google-cloud-storage>=2.18
+google-cloud-firestore>=2.19

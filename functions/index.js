@@ -15,6 +15,7 @@ import { initializeApp } from 'firebase-admin/app';
 import { getFirestore, FieldValue } from 'firebase-admin/firestore';
 import { onDocumentCreated } from 'firebase-functions/v2/firestore';
 import { logger } from 'firebase-functions';
+import { JobsClient } from '@google-cloud/run';
 
 // The project's Firestore database is named "lyricbloom" rather than the
 // usual "(default)", so both the Admin SDK and the trigger must name it.
@@ -201,6 +202,69 @@ export const fetchLyrics = onDocumentCreated(
     } catch (err) {
       logger.error('fetchLyrics failed', { artist, title, songId, error: err.message });
       await snap.ref.update({ lyricsStatus: 'error' });
+    }
+  },
+);
+
+// startSeparation: when the app creates users/{uid}/separations/{id} (after
+// uploading the song to Storage), start the separate-stems Cloud Run Job
+// (separation/worker.py) for it. The job does the slow part and updates
+// the doc itself; this only validates the request and launches the job,
+// so it returns in about a second instead of waiting minutes.
+const SEPARATION_JOB_REGION = 'us-east1'; // same region as the Storage bucket
+const SEPARATION_JOB_NAME = 'separate-stems';
+// Separations a user can have in flight at once, so a stuck or scripted
+// client can't start hundreds of billed jobs.
+const MAX_ACTIVE_SEPARATIONS = 3;
+const ACTIVE_STATUSES = ['queued', 'starting', 'running'];
+
+const jobsClient = new JobsClient();
+
+export const startSeparation = onDocumentCreated(
+  { document: 'users/{uid}/separations/{separationId}', database: DATABASE_ID },
+  async (event) => {
+    const snap = event.data;
+    if (!snap) return;
+    const { uid, separationId } = event.params;
+    const { inputPath } = snap.data();
+
+    // The job may only touch this separation's own folder.
+    if (typeof inputPath !== 'string' || !inputPath.startsWith(`users/${uid}/separations/${separationId}/`)) {
+      await snap.ref.update({ status: 'error', error: 'Invalid input path.' });
+      return;
+    }
+
+    const active = await snap.ref.parent.where('status', 'in', ACTIVE_STATUSES).count().get();
+    // `active` includes this doc (status 'queued').
+    if (active.data().count > MAX_ACTIVE_SEPARATIONS) {
+      await snap.ref.update({
+        status: 'error',
+        error: `Only ${MAX_ACTIVE_SEPARATIONS} separations can run at once. Try again when one finishes.`,
+      });
+      return;
+    }
+
+    await snap.ref.update({ status: 'starting' });
+    try {
+      const name = jobsClient.jobPath(process.env.GCLOUD_PROJECT, SEPARATION_JOB_REGION, SEPARATION_JOB_NAME);
+      // runJob returns a long-running operation for the whole execution;
+      // don't wait on it, just record which execution is ours.
+      const [operation] = await jobsClient.runJob({
+        name,
+        overrides: {
+          containerOverrides: [{
+            env: [
+              { name: 'SEPARATION_UID', value: uid },
+              { name: 'SEPARATION_ID', value: separationId },
+              { name: 'INPUT_PATH', value: inputPath },
+            ],
+          }],
+        },
+      });
+      await snap.ref.update({ execution: operation.metadata?.name ?? null });
+    } catch (err) {
+      logger.error('startSeparation failed', { uid, separationId, error: err.message });
+      await snap.ref.update({ status: 'error', error: 'Could not start the separation job.' });
     }
   },
 );
