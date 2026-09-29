@@ -3,6 +3,7 @@ import Stage from './Stage.jsx';
 import { STAGE_CHANNEL_NAME } from './lib/stageChannel.js';
 import { FLORAL_PALETTE, DEFAULT_STAGE_COLORS, DEFAULT_LYRIC_COLOR, DEFAULT_LYRIC_SIZE, DEFAULT_PARTICLE_SIZE } from './lib/palette.js';
 import { DEFAULT_TEXT_EFFECT } from './lib/textEffects.js';
+import { DEFAULT_GLB_SETTINGS, EMPTY_AUDIO_LEVELS } from './lib/stageThemes.js';
 
 /* =========================================================================
    StagePopout — the visualizer-only view opened in a second tab.
@@ -15,7 +16,7 @@ import { DEFAULT_TEXT_EFFECT } from './lib/textEffects.js';
    ========================================================================= */
 export default function StagePopout() {
   const audioTimeRef = useRef({ currentTime: 0, duration: 0 });
-  const bassRef = useRef(0);
+  const audioLevelsRef = useRef(EMPTY_AUDIO_LEVELS);
   const placedBlocksRef = useRef([]);
   // Mirrors placedBlocksRef into real state too — Stage's per-block font
   // preloading effect needs a reactive prop to key off of, not just a ref it
@@ -30,6 +31,7 @@ export default function StagePopout() {
   const [lyricSize, setLyricSize] = useState(DEFAULT_LYRIC_SIZE);
   const [particleSize, setParticleSize] = useState(DEFAULT_PARTICLE_SIZE);
   const [textEffect, setTextEffect] = useState(DEFAULT_TEXT_EFFECT);
+  const [glbSettings, setGlbSettings] = useState(DEFAULT_GLB_SETTINGS);
 
   useEffect(() => {
     const channel = new BroadcastChannel(STAGE_CHANNEL_NAME);
@@ -39,7 +41,7 @@ export default function StagePopout() {
       switch (msg.type) {
         case 'sync':
           audioTimeRef.current = { currentTime: msg.currentTime, duration: msg.duration };
-          bassRef.current = msg.bass;
+          audioLevelsRef.current = msg.levels;
           break;
         case 'lyrics':
           placedBlocksRef.current = msg.placedBlocks;
@@ -69,6 +71,9 @@ export default function StagePopout() {
         case 'textEffect':
           setTextEffect(msg.textEffect);
           break;
+        case 'glbSettings':
+          setGlbSettings(msg.glbSettings);
+          break;
         default:
           break;
       }
@@ -87,7 +92,7 @@ export default function StagePopout() {
     <div className="min-h-screen w-screen bg-bg">
       <Stage
         audioTimeRef={audioTimeRef}
-        bassRef={bassRef}
+        audioLevelsRef={audioLevelsRef}
         placedBlocksRef={placedBlocksRef}
         placedBlocks={placedBlocks}
         particleShapeBuffer={shapeBuffer}
@@ -98,6 +103,7 @@ export default function StagePopout() {
         textSize={lyricSize}
         particleSize={particleSize}
         textEffect={textEffect}
+        glbSettings={glbSettings}
         heightClassName="h-screen"
       />
     </div>

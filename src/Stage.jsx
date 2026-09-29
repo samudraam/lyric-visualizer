@@ -5,6 +5,7 @@ import { FLORAL_PALETTE, DEFAULT_STAGE_COLORS, DEFAULT_LYRIC_COLOR, DEFAULT_LYRI
 import { loadCustomFont, CUSTOM_FONT_FAMILY, customFontFaceCss, blockFontFamily } from './lib/font.js';
 import { VFX } from '@vfx-js/core';
 import { DEFAULT_TEXT_EFFECT, getTextEffect } from './lib/textEffects.js';
+import { DEFAULT_GLB_SETTINGS, readSignal } from './lib/stageThemes.js';
 
 /* =========================================================================
    MODULE-LEVEL CONSTANTS & PURE HELPER FUNCTIONS
@@ -37,11 +38,16 @@ function createParticleTexture() {
 const POINTS_PARTICLE_COUNT = 650;
 const MESH_PARTICLE_COUNT = 220;
 
-// Generates the shared physics state for a batch of falling particles —
-// starting position, fall speed, drift phase, and a palette color — used
-// by both the default sprite points and the custom-shape instanced mesh.
+// Generates the shared physics state for a batch of particles — starting
+// position, fall speed, drift phase, and a palette color — used by both the
+// default sprite points and the custom-shape instanced mesh. `home` (a box
+// filling the view) and `ring` (a hollow cylinder around the y axis, kept
+// inside the camera's distance so nothing sweeps through the lens) are the
+// resting layouts for the "Still" and "Rotation" motion modes.
 function createParticleField(count, palette) {
   const positions = new Float32Array(count * 3);
+  const home = new Float32Array(count * 3);
+  const ring = new Float32Array(count * 3);
   const colors = new Float32Array(count * 3);
   const speeds = new Float32Array(count);
   const phases = new Float32Array(count);
@@ -50,6 +56,16 @@ function createParticleField(count, palette) {
     positions[i * 3] = (Math.random() - 0.5) * 16;
     positions[i * 3 + 1] = Math.random() * 12 - 5;
     positions[i * 3 + 2] = (Math.random() - 0.5) * 6;
+
+    home[i * 3] = (Math.random() - 0.5) * 14;
+    home[i * 3 + 1] = (Math.random() - 0.5) * 8;
+    home[i * 3 + 2] = (Math.random() - 0.5) * 5;
+
+    const angle = Math.random() * Math.PI * 2;
+    const radius = 1.2 + Math.random() * 3.3;
+    ring[i * 3] = Math.cos(angle) * radius;
+    ring[i * 3 + 1] = (Math.random() - 0.5) * 7;
+    ring[i * 3 + 2] = Math.sin(angle) * radius;
 
     speeds[i] = 0.006 + Math.random() * 0.018;
     phases[i] = Math.random() * Math.PI * 2;
@@ -61,14 +77,14 @@ function createParticleField(count, palette) {
     colors[i * 3 + 2] = c.b;
   }
 
-  return { positions, colors, speeds, phases, count };
+  return { positions, home, ring, colors, speeds, phases, count };
 }
 
 // Pulls the first mesh out of a loaded glTF, then centers it and normalizes
 // its geometry to a max dimension of 1 — regardless of the original model's
 // size/origin, so it can be scaled to any on-screen size later. The actual
 // visual size is applied per-frame in the animate loop below (particleSize
-// prop × the bass-reactive pulse), so adjusting it doesn't require re-parsing
+// prop × the audio-reactive pulse), so adjusting it doesn't require re-parsing
 // the .glb.
 function extractParticleGeometry(gltf) {
   gltf.scene.updateMatrixWorld(true);
@@ -102,7 +118,8 @@ function extractParticleGeometry(gltf) {
    -------------------------------------------------------------------------
    Deliberately reads its live playback data through plain refs instead of
    touching an <audio> element or AnalyserNode directly: `audioTimeRef` and
-   `bassRef` are written every frame by whoever renders this component. In
+   `audioLevelsRef` (bass/mids/highs/level, plus vocals/music when stems are
+   loaded — see EMPTY_AUDIO_LEVELS) are written every frame by whoever renders this component. In
    LyricBloom.jsx that's a real Web Audio analyser; in the pop-out tab
    (StagePopout.jsx) it's values mirrored in over BroadcastChannel. Stage
    itself doesn't need to know or care which — same code path either way.
@@ -113,7 +130,7 @@ const DEFAULT_HEIGHT_CLASSES = 'h-[55vh] sm:h-[42vh] min-h-[260px]';
 
 export default function Stage({
   audioTimeRef,
-  bassRef,
+  audioLevelsRef,
   placedBlocksRef,
   placedBlocks = [],
   particleShapeBuffer,
@@ -126,6 +143,7 @@ export default function Stage({
   particleSize = DEFAULT_PARTICLE_SIZE,
   heightClassName = DEFAULT_HEIGHT_CLASSES,
   textEffect = DEFAULT_TEXT_EFFECT,
+  glbSettings = DEFAULT_GLB_SETTINGS,
 }) {
   // The whole active placedBlocks entry (or null), not just its text — so a
   // block's own textColor/textEffect/font overrides (see the "effective *"
@@ -242,11 +260,16 @@ export default function Stage({
   const particleTextureRef = useRef(null);
   // The animate loop below is set up once on mount (empty dependency array),
   // so it reads particleSize through this ref instead of the prop directly —
-  // same "live mirror" trick as bassRef/audioTimeRef.
+  // same "live mirror" trick as audioLevelsRef/audioTimeRef.
   const particleSizeRef = useRef(particleSize);
   useEffect(() => {
     particleSizeRef.current = particleSize;
   }, [particleSize]);
+  // Motion mode / reactive source / multipliers, read the same way.
+  const glbSettingsRef = useRef({ ...DEFAULT_GLB_SETTINGS, ...glbSettings });
+  useEffect(() => {
+    glbSettingsRef.current = { ...DEFAULT_GLB_SETTINGS, ...glbSettings };
+  }, [glbSettings]);
   // Same live-mirror trick, but for the active block's effective text effect
   // (global default, or that block's own override) — read by the mount
   // effect below and the ref callback in the JSX, neither of which can read
@@ -422,35 +445,69 @@ export default function Stage({
 
     // --- The animation loop -------------------------------------------------
     // This loop does TWO jobs every frame:
-    //   1. Moves the particles (and reacts to bass energy from audioTimeRef/bassRef)
+    //   1. Moves the particles, per the motion mode in glbSettings, reacting
+    //      to whichever audio signal it's set to (audioLevelsRef)
     //   2. Detects which lyric block is "active" right now
+    let lastTime = performance.now();
+    let spinAngle = 0; // accumulated field rotation for the "Rotation" mode
+    let tumble = 0;    // accumulated per-particle .glb tumble, so dragging the Spin slider doesn't jump
     const animate = () => {
       rafRef.current = requestAnimationFrame(animate);
-      const t = performance.now() * 0.001;
-      const bass = bassRef.current || 0;
+      const now = performance.now();
+      // Frame-rate independent, clamped so a backgrounded tab doesn't jump.
+      const dt = Math.min((now - lastTime) / 1000, 0.1);
+      lastTime = now;
+      const t = now * 0.001;
+      const settings = glbSettingsRef.current;
+      const signal = Math.min(readSignal(audioLevelsRef.current, settings.reactTo) * settings.sensitivity, 2);
+      const frames = dt * 60; // the per-frame constants below were tuned at 60 fps
 
       // --- particle motion ---
       const p = particlesRef.current;
-      for (let i = 0; i < p.count; i++) {
-        const ix = i * 3;
-        const iy = i * 3 + 1;
-        p.positions[iy] -= p.speeds[i] * (1 + bass * 1.6);          // fall, boosted by bass
-        p.positions[ix] += Math.sin(t * 0.6 + p.phases[i]) * 0.01;  // gentle sideways drift
-        if (p.positions[iy] < -6) {
-          p.positions[iy] = 6 + Math.random() * 2;   // recycle to the top
-          p.positions[ix] = (Math.random() - 0.5) * 16;
+      if (settings.motion === 'float') {
+        // Still: each particle rests at its home spot, breathing gently, and
+        // the whole field blooms outward from the center with the signal.
+        const spread = 1 + signal * 0.35;
+        for (let i = 0; i < p.count; i++) {
+          const ix = i * 3;
+          const wobble = Math.sin(t * 0.8 * settings.speed + p.phases[i]) * 0.12;
+          p.positions[ix] = p.home[ix] * spread + wobble;
+          p.positions[ix + 1] = p.home[ix + 1] * spread + Math.cos(t * 0.7 * settings.speed + p.phases[i]) * 0.12;
+          p.positions[ix + 2] = p.home[ix + 2];
         }
+        p.object3D.rotation.y = 0;
+      } else if (settings.motion === 'orbit') {
+        // Rotation: particles sit on a ring and the whole field spins, with
+        // the signal driving the spin speed (a kick = a lurch forward).
+        spinAngle += dt * settings.speed * (0.12 + signal * 2.2);
+        for (let i = 0; i < p.count * 3; i++) p.positions[i] = p.ring[i];
+        p.object3D.rotation.y = spinAngle;
+      } else {
+        // Falling (default): drift down, faster with the signal.
+        for (let i = 0; i < p.count; i++) {
+          const ix = i * 3;
+          const iy = i * 3 + 1;
+          p.positions[iy] -= p.speeds[i] * settings.speed * (1 + signal * 1.6) * frames;
+          p.positions[ix] += Math.sin(t * 0.6 + p.phases[i]) * 0.01 * frames; // gentle sideways drift
+          if (p.positions[iy] < -6) {
+            p.positions[iy] = 6 + Math.random() * 2;   // recycle to the top
+            p.positions[ix] = (Math.random() - 0.5) * 16;
+          }
+        }
+        p.object3D.rotation.y = 0;
       }
+
       if (p.mode === 'points') {
         p.object3D.geometry.attributes.position.needsUpdate = true;
-        p.object3D.material.size = 0.13 + bass * 0.16;
+        p.object3D.material.size = 0.13 + signal * 0.16 * settings.pulse;
       } else {
         // Instanced .glb shapes: no geometry attribute to touch — each
         // particle's transform is written straight into the instance matrix.
-        const scale = particleSizeRef.current * (1 + bass * 0.5);
+        const scale = particleSizeRef.current * (1 + signal * 0.5 * settings.pulse);
+        tumble += dt * settings.spin;
         for (let i = 0; i < p.count; i++) {
           p.dummy.position.set(p.positions[i * 3], p.positions[i * 3 + 1], p.positions[i * 3 + 2]);
-          p.dummy.rotation.set(t * 0.3 + p.phases[i], t * 0.2 + p.phases[i] * 1.3, 0);
+          p.dummy.rotation.set(tumble * 0.3 + p.phases[i], tumble * 0.2 + p.phases[i] * 1.3, 0);
           p.dummy.scale.setScalar(scale);
           p.dummy.updateMatrix();
           p.object3D.setMatrixAt(i, p.dummy.matrix);

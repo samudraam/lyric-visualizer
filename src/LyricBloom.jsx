@@ -1,13 +1,17 @@
 import { useRef, useState, useEffect, useMemo } from 'react';
-import { Play, Pause, Upload, Plus, Box, X, RotateCcw, Type, ExternalLink, Settings, LogIn, LogOut, Cloud, CloudOff, FilePlus, Layers, AudioLines, FolderOpen } from 'lucide-react';
+import { Play, Pause, Upload, Plus, Box, X, RotateCcw, Type, ExternalLink, Settings, LogIn, LogOut, Cloud, CloudOff, FilePlus, Layers, AudioLines, FolderOpen, Check, Trash2, Sparkles } from 'lucide-react';
 import Stage from './Stage.jsx';
 import LyricFinder from './LyricFinder.jsx';
 import Knob from './Knob.jsx';
+import FloatingPanel from './FloatingPanel.jsx';
 import { FLORAL_PALETTE, DEFAULT_STAGE_COLORS, DEFAULT_LYRIC_COLOR, DEFAULT_LYRIC_SIZE, DEFAULT_PARTICLE_SIZE } from './lib/palette.js';
 import { loadCustomFont, CUSTOM_FONT_FAMILY } from './lib/font.js';
 import { STAGE_CHANNEL_NAME } from './lib/stageChannel.js';
 import { TEXT_EFFECTS, DEFAULT_TEXT_EFFECT } from './lib/textEffects.js';
 import { loadState, saveState } from './lib/persistence.js';
+import {
+  STAGE_THEMES, MOTION_MODES, REACT_SOURCES, DEFAULT_GLB_SETTINGS, EMPTY_AUDIO_LEVELS, matchStageTheme,
+} from './lib/stageThemes.js';
 import { signInWithGoogle, signOutUser } from './lib/firebase.js';
 import { useCloudMix } from './lib/useCloudMix.js';
 import { useCloudSeparation } from './lib/useCloudSeparation.js';
@@ -40,14 +44,30 @@ const formatTime = (seconds) => {
   return `${m}:${s.toString().padStart(2, '0')}`;
 };
 
-// Shared Tailwind classes for the header's pill buttons — background is left
-// out here since it differs per button (default panel vs. the play button's
-// gradient), so each usage appends its own bg-*/hover:bg-* classes.
+// Shared Tailwind classes for buttons. BTN_BASE leaves out the background
+// (the play button uses a gradient); BTN is the standard icon + label
+// button, ICON_BTN its square icon-only form, which always gets an
+// aria-label and a title since there's no visible text.
 const BTN_BASE =
-  'inline-flex items-center gap-2 text-text border border-white/10 rounded-lg ' +
-  'px-3.5 py-2 text-[13px] cursor-pointer transition-all duration-150 active:scale-[0.97] ' +
+  'inline-flex items-center justify-center gap-2 h-9 text-text border border-white/10 rounded-lg ' +
+  'px-3 text-[13px] font-medium whitespace-nowrap cursor-pointer transition-all duration-150 active:scale-[0.97] ' +
   'disabled:opacity-40 disabled:cursor-not-allowed focus-visible:outline ' +
   'focus-visible:outline-2 focus-visible:outline-accent focus-visible:outline-offset-2';
+const BTN = `${BTN_BASE} bg-white/5 hover:bg-white/10`;
+const ICON_BTN = `${BTN} w-9 px-0`;
+
+// Average energy (0..1) of an analyser's byte-frequency data between two
+// frequencies. `binHz` is the width of one FFT bin (sampleRate / fftSize).
+function bandLevel(data, binHz, loHz, hiHz, boost = 1) {
+  const from = Math.max(1, Math.floor(loHz / binHz)); // bin 0 is DC offset, not signal
+  const to = Math.min(data.length, Math.ceil(hiHz / binHz));
+  let sum = 0;
+  for (let i = from; i < to; i++) sum += data[i];
+  return Math.min(1, (sum / (Math.max(1, to - from) * 255)) * boost);
+}
+
+// Color-picker swatch in the settings panel.
+const SWATCH = 'w-8 h-8 rounded-md border border-white/10 bg-transparent p-0 cursor-pointer';
 
 // Works out which of two chosen stem files is the vocals and which is the
 // background music, from their names. Demucs names them vocals.wav and
@@ -66,7 +86,7 @@ function assignStemFiles([a, b]) {
 
 // Shared classes for text inputs/selects (lyric finder, mix picker).
 const FIELD_BASE =
-  'bg-panel-2 text-text border border-white/10 rounded-lg px-3 py-2 text-[13px] ' +
+  'bg-white/5 text-text border border-white/10 rounded-lg px-3 py-2 text-[13px] ' +
   'disabled:opacity-40 focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent';
 
 const SAVE_STATUS_TEXT = {
@@ -136,6 +156,8 @@ export default function LyricBloom() {
   const [lyricSize, setLyricSize] = useState(savedState.lyricSize ?? DEFAULT_LYRIC_SIZE); // active-lyric max font size (px) on Stage
   const [particleSize, setParticleSize] = useState(savedState.particleSize ?? DEFAULT_PARTICLE_SIZE); // uploaded .glb particle scale on Stage
   const [textEffect, setTextEffect] = useState(savedState.textEffect ?? DEFAULT_TEXT_EFFECT); // active-lyric WebGL shader id, see lib/textEffects.js
+  const [glbSettings, setGlbSettings] = useState({ ...DEFAULT_GLB_SETTINGS, ...savedState.glbSettings }); // particle motion + what it reacts to, see lib/stageThemes.js
+  const [showGlbPanel, setShowGlbPanel] = useState(false); // stage theme / motion panel
 
   /* =======================================================================
      REFS
@@ -146,7 +168,7 @@ export default function LyricBloom() {
      1. DOM handles (audioRef, trackRef, playheadRef) — so we can
         imperatively read/write actual DOM nodes.
      2. "Live mirrors" of state (placedBlocksRef) or continuously-updated
-        values (audioTimeRef, bassRef) that Stage's own animation loop reads
+        values (audioTimeRef, audioLevelsRef) that Stage's own animation loop reads
         every frame without needing to be re-created whenever state changes.
         This sidesteps the classic "stale closure" bug: a function created in
         one render only "remembers" the state values from THAT render unless
@@ -157,19 +179,26 @@ export default function LyricBloom() {
   const mainGainRef = useRef(null);    // GainNode after audioRef (the BGM dial in stems mode)
   const vocalsGainRef = useRef(null);  // GainNode after vocalsAudioRef (the vocals dial)
   const audioCtxRef = useRef(null);
-  const analyserRef = useRef(null);
+  const analyserRef = useRef(null);        // whole mix (both elements), after the dials
   const dataArrayRef = useRef(null);
+  // Per-stem taps, before the dials, so the visuals can react to the vocals
+  // even while they're turned down (karaoke mode). Only meaningful with
+  // stems loaded; without them the "music" tap is just the full mix.
+  const musicAnalyserRef = useRef(null);
+  const vocalsAnalyserRef = useRef(null);
+  const stemDataRef = useRef(null);
   const rafRef = useRef(null); // requestAnimationFrame id for the audio-sync loop below
 
   const trackRef = useRef(null);       // timeline track div (for drop-position math)
   const playheadRef = useRef(null);    // playhead line — mutated directly, not via state
   const timeDisplayRef = useRef(null); // "0:42 / 3:10" text — also mutated directly
+  const timelineScrollRef = useRef(null); // the timeline's horizontal scroller, which follows the playhead
 
   const placedBlocksRef = useRef([]);
   // Fed to Stage every frame instead of Stage reading <audio>/AnalyserNode
   // directly — see Stage.jsx's top comment for why.
   const audioTimeRef = useRef({ currentTime: 0, duration: 0 });
-  const bassRef = useRef(0);
+  const audioLevelsRef = useRef(EMPTY_AUDIO_LEVELS);
 
   // Keep placedBlocksRef in sync whenever the real state changes, so Stage's
   // animation loop always sees fresh lyric-timing data.
@@ -177,8 +206,15 @@ export default function LyricBloom() {
     placedBlocksRef.current = placedBlocks;
   }, [placedBlocks]);
 
+  // Mirrors allSelected for the once-registered keydown listener below.
+  const allSelectedRef = useRef(false);
+  useEffect(() => {
+    allSelectedRef.current = allSelected;
+  }, [allSelected]);
+
   // Keyboard shortcuts: Space plays/pauses, S toggles "select all blocks"
-  // (drag any one to shift the whole song), Esc clears it. Ignored while
+  // (drag any one to shift the whole song), D while they're selected sends
+  // them all back to the bank, Esc clears the selection. Ignored while
   // typing in a field so Space and "s" still type into the lyric/artist/
   // title inputs.
   // togglePlay is re-created every render (it reads isPlaying/audioURL), so
@@ -198,6 +234,17 @@ export default function LyricBloom() {
         if (placedBlocksRef.current.length === 0) return;
         e.preventDefault();
         setAllSelected((v) => !v);
+      } else if (e.key === 'd' || e.key === 'D') {
+        if (!allSelectedRef.current) return;
+        e.preventDefault();
+        // Back to the bank in song order, so they can be re-placed in sequence.
+        const lines = [...placedBlocksRef.current]
+          .sort((a, b) => a.start - b.start)
+          .map((b) => ({ id: b.id, text: b.text }));
+        setLyricBank((prev) => [...prev, ...lines]);
+        setPlacedBlocks([]);
+        setSelectedBlockId(null);
+        setAllSelected(false);
       } else if (e.key === 'Escape') {
         setAllSelected(false);
       }
@@ -242,11 +289,12 @@ export default function LyricBloom() {
       lyricSize,
       particleSize,
       textEffect,
+      glbSettings,
       vocalsVolume,
       bgmVolume,
       stemsSeparationId,
     }),
-    [lyricBank, placedBlocks, nextId, palette, stageColors, lyricColor, lyricSize, particleSize, textEffect, vocalsVolume, bgmVolume, stemsSeparationId],
+    [lyricBank, placedBlocks, nextId, palette, stageColors, lyricColor, lyricSize, particleSize, textEffect, glbSettings, vocalsVolume, bgmVolume, stemsSeparationId],
   );
 
   useEffect(() => {
@@ -266,6 +314,7 @@ export default function LyricBloom() {
     setLyricSize(s.lyricSize ?? DEFAULT_LYRIC_SIZE);
     setParticleSize(s.particleSize ?? DEFAULT_PARTICLE_SIZE);
     setTextEffect(s.textEffect ?? DEFAULT_TEXT_EFFECT);
+    setGlbSettings({ ...DEFAULT_GLB_SETTINGS, ...s.glbSettings });
     setVocalsVolume(s.vocalsVolume ?? 1);
     setBgmVolume(s.bgmVolume ?? 1);
     // A mix without saved stems keeps whatever audio is loaded, same as
@@ -319,6 +368,7 @@ export default function LyricBloom() {
   const lyricSizeRef = useRef(lyricSize);
   const particleSizeRef = useRef(particleSize);
   const textEffectRef = useRef(textEffect);
+  const glbSettingsRef = useRef(glbSettings);
 
   useEffect(() => {
     const channel = new BroadcastChannel(STAGE_CHANNEL_NAME);
@@ -337,6 +387,7 @@ export default function LyricBloom() {
       channel.postMessage({ type: 'lyricSize', lyricSize: lyricSizeRef.current });
       channel.postMessage({ type: 'particleSize', particleSize: particleSizeRef.current });
       channel.postMessage({ type: 'textEffect', textEffect: textEffectRef.current });
+      channel.postMessage({ type: 'glbSettings', glbSettings: glbSettingsRef.current });
     };
 
     return () => channel.close();
@@ -386,12 +437,17 @@ export default function LyricBloom() {
     channelRef.current?.postMessage({ type: 'textEffect', textEffect });
   }, [textEffect]);
 
+  useEffect(() => {
+    glbSettingsRef.current = glbSettings;
+    channelRef.current?.postMessage({ type: 'glbSettings', glbSettings });
+  }, [glbSettings]);
+
   /* =======================================================================
      AUDIO-SYNC LOOP — runs exactly once (empty dependency array)
      -----------------------------------------------------------------------
      Drives everything that needs to track audio.currentTime every frame:
-     the bass-energy calculation Stage reacts to, the playhead position, and
-     the time readout. Writes into audioTimeRef/bassRef instead of React
+     the audio levels Stage reacts to, the playhead position, and the time
+     readout. Writes into audioTimeRef/audioLevelsRef instead of React
      state — pushing 60 setState calls/second through React's reconciler for
      values Stage just reads imperatively would be wasted work.
      ======================================================================= */
@@ -399,16 +455,29 @@ export default function LyricBloom() {
     const animate = () => {
       rafRef.current = requestAnimationFrame(animate);
 
-      // --- audio analysis: average energy in the low frequency bins ---
-      let bass = 0;
-      if (analyserRef.current && dataArrayRef.current) {
-        analyserRef.current.getByteFrequencyData(dataArrayRef.current);
-        const bassRange = 12; // first N FFT bins ≈ bass/kick energy
-        let sum = 0;
-        for (let i = 0; i < bassRange; i++) sum += dataArrayRef.current[i];
-        bass = sum / (bassRange * 255); // normalize to 0..1
+      // --- audio analysis: band energies + per-stem levels, all 0..1 ---
+      let levels = EMPTY_AUDIO_LEVELS;
+      const analyser = analyserRef.current;
+      if (analyser && dataArrayRef.current) {
+        const data = dataArrayRef.current;
+        const binHz = analyser.context.sampleRate / analyser.fftSize;
+        analyser.getByteFrequencyData(data);
+        const stemData = stemDataRef.current;
+        musicAnalyserRef.current.getByteFrequencyData(stemData);
+        const music = bandLevel(stemData, binHz, 20, 16000, 1.6);
+        vocalsAnalyserRef.current.getByteFrequencyData(stemData);
+        const vocals = bandLevel(stemData, binHz, 100, 8000, 1.6);
+        levels = {
+          bass: bandLevel(data, binHz, 20, 250),
+          mids: bandLevel(data, binHz, 250, 4000, 1.4),
+          highs: bandLevel(data, binHz, 4000, 16000, 2.2), // quieter band, boosted to a comparable range
+          level: bandLevel(data, binHz, 20, 16000, 1.6),
+          vocals,
+          music,
+          hasStems: !!vocalsAudioRef.current?.getAttribute('src'),
+        };
       }
-      bassRef.current = bass;
+      audioLevelsRef.current = levels;
 
       // --- sync playhead + shared audio-time ref from the <audio> element ---
       const audioEl = audioRef.current;
@@ -419,6 +488,19 @@ export default function LyricBloom() {
 
         if (playheadRef.current) {
           playheadRef.current.style.left = `${timeToX(ct)}px`;
+        }
+
+        // While playing, scroll the timeline with the playhead: once it
+        // passes the middle of the visible area it stays centred, and if
+        // it's out of view (after a seek, or the user scrolled away) it's
+        // brought straight back. Paused, the timeline scrolls freely.
+        const scroller = timelineScrollRef.current;
+        if (scroller && !audioEl.paused) {
+          const x = scroller.firstElementChild.offsetLeft + timeToX(ct); // offsetLeft = the scroller's padding
+          const posInView = x - scroller.scrollLeft;
+          if (posInView < 0 || posInView > scroller.clientWidth / 2) {
+            scroller.scrollLeft = x - scroller.clientWidth / 2; // the browser clamps this to the scroll range
+          }
         }
         if (timeDisplayRef.current) {
           timeDisplayRef.current.textContent = `${formatTime(ct)} / ${formatTime(dur)}`;
@@ -440,7 +522,7 @@ export default function LyricBloom() {
         type: 'sync',
         currentTime: audioTimeRef.current.currentTime,
         duration: audioTimeRef.current.duration,
-        bass,
+        levels,
       });
     };
     animate();
@@ -459,7 +541,7 @@ export default function LyricBloom() {
     const AudioContextClass = window.AudioContext || window.webkitAudioContext;
     const ctx = new AudioContextClass();
     const analyser = ctx.createAnalyser();
-    analyser.fftSize = 256;
+    analyser.fftSize = 1024; // ~43 Hz bins: fine enough to split bass/mids/highs
     // Graph: main <audio>   → gain (BGM dial)    ┐
     //        vocals <audio> → gain (vocals dial) ┴→ analyser → speakers.
     // Routing through the analyser doesn't change what you hear; it just
@@ -469,11 +551,24 @@ export default function LyricBloom() {
     // already played outside the graph.
     const mainGain = ctx.createGain();
     mainGain.gain.value = stems ? bgmVolume : 1;
-    ctx.createMediaElementSource(audioRef.current).connect(mainGain).connect(analyser);
+    const mainSource = ctx.createMediaElementSource(audioRef.current);
+    mainSource.connect(mainGain).connect(analyser);
     const vocalsGain = ctx.createGain();
     vocalsGain.gain.value = vocalsVolume;
-    ctx.createMediaElementSource(vocalsAudioRef.current).connect(vocalsGain).connect(analyser);
+    const vocalsSource = ctx.createMediaElementSource(vocalsAudioRef.current);
+    vocalsSource.connect(vocalsGain).connect(analyser);
     analyser.connect(ctx.destination);
+    // Side taps for the per-stem levels: dead ends (not wired to the
+    // speakers), so they only read the signal and never change what you hear.
+    const musicAnalyser = ctx.createAnalyser();
+    musicAnalyser.fftSize = analyser.fftSize;
+    mainSource.connect(musicAnalyser);
+    const vocalsAnalyser = ctx.createAnalyser();
+    vocalsAnalyser.fftSize = analyser.fftSize;
+    vocalsSource.connect(vocalsAnalyser);
+    musicAnalyserRef.current = musicAnalyser;
+    vocalsAnalyserRef.current = vocalsAnalyser;
+    stemDataRef.current = new Uint8Array(analyser.frequencyBinCount);
 
     mainGainRef.current = mainGain;
     vocalsGainRef.current = vocalsGain;
@@ -702,6 +797,22 @@ export default function LyricBloom() {
 
   const handleResetTextEffect = () => setTextEffect(DEFAULT_TEXT_EFFECT);
 
+  /* =======================================================================
+     GLB SETTINGS PANEL — stage themes + particle motion
+     ======================================================================= */
+  const activeTheme = matchStageTheme(palette, stageColors, glbSettings);
+
+  // A theme sets the look (palette + stage gradient) and the motion together.
+  const applyStageTheme = (themeId) => {
+    const theme = STAGE_THEMES.find((t) => t.id === themeId);
+    if (!theme) return;
+    setPalette(theme.palette);
+    setStageColors(theme.stageColors);
+    setGlbSettings(theme.glbSettings);
+  };
+
+  const updateGlbSetting = (key, value) => setGlbSettings((prev) => ({ ...prev, [key]: value }));
+
   // Opens the visualizer-only pop-out. A named window target means clicking
   // this again re-focuses the same tab instead of spawning duplicates.
   const handleSignIn = () => {
@@ -770,6 +881,8 @@ export default function LyricBloom() {
   const handleRemoveFromBank = (id) => {
     setLyricBank(prev => prev.filter(b => b.id !== id))
   };
+
+  const handleClearBank = () => setLyricBank([]);
 
   /* =======================================================================
      DRAG FROM BANK → DROP ONTO TIMELINE
@@ -969,26 +1082,43 @@ export default function LyricBloom() {
   }
 
   return (
-    <div className="min-h-screen flex flex-col gap-3.5 p-5 bg-bg text-text font-mono">
-      <header className="flex items-center justify-between flex-wrap gap-3">
-        <h1 className="font-display font-bold text-[26px] m-0 tracking-[0.3px]">Lyric Bloom</h1>
-        <div className="flex items-center gap-2.5 flex-wrap">
-          <label className={`${BTN_BASE} bg-panel-2 hover:bg-[#2E2136]`}>
+    <div className="min-h-screen flex flex-col gap-4 px-5 pb-5 bg-bg text-text font-sans">
+      {/* Sticky, so play/pause and Settings stay in reach however far the
+          page is scrolled. No backdrop-filter here: it would make this the
+          containing block for the fixed-position dropdown overlays inside. */}
+      <header className="sticky top-0 z-30 -mx-5 px-5 py-3 bg-bg/95 border-b border-white/5 flex flex-col gap-1.5">
+        <div className="flex items-center gap-2 flex-wrap">
+          <h1 className="font-display font-bold text-lg m-0 tracking-tight mr-2">Lyric Bloom</h1>
+
+          <button
+            className={`${BTN_BASE} w-9 px-0 rounded-full border-none bg-gradient-to-br from-[#E14F84] to-[#F2A93B] text-[#1A1120]`}
+            onClick={togglePlay}
+            disabled={!audioURL}
+            aria-label={isPlaying ? 'Pause' : 'Play'}
+            title={`${isPlaying ? 'Pause' : 'Play'} (Space)`}
+          >
+            {isPlaying ? <Pause size={16} fill="currentColor" /> : <Play size={16} fill="currentColor" className="ml-0.5" />}
+          </button>
+          <span ref={timeDisplayRef} className="text-[13px] text-text-dim tabular-nums min-w-[84px]">0:00 / 0:00</span>
+
+          <ToolbarDivider />
+
+          <label className={BTN} title={audioName ? `Loaded: ${audioName} · click to replace` : 'Upload a song'}>
             <Upload size={16} />
-            <span>{audioName || 'Upload audio'}</span>
+            <span className="max-w-[180px] truncate">{audioName || 'Audio'}</span>
             <input type="file" accept="audio/*" onChange={handleAudioFile} className="hidden" />
           </label>
           <label
-            className={`${BTN_BASE} bg-panel-2 hover:bg-[#2E2136]`}
+            className={BTN}
             title="Load a vocals file and an instrumental file together (e.g. from separation/separate.py) to mix them with dials"
           >
             <Layers size={16} />
-            <span>Load stems</span>
+            <span>Stems</span>
             <input type="file" accept="audio/*" multiple onChange={handleStemFiles} className="hidden" />
           </label>
           {user && audioFile && !stems && (
             <button
-              className={`${BTN_BASE} bg-panel-2 hover:bg-[#2E2136]`}
+              className={BTN}
               onClick={() => separation.start(audioFile)}
               disabled={separation.busy}
               title="Separate this song into vocals and instrumental on Google Cloud, then load them into the mixer"
@@ -1000,13 +1130,13 @@ export default function LyricBloom() {
           {user && (
             <div className="relative">
               <button
-                className={`${BTN_BASE} bg-panel-2 hover:bg-[#2E2136]`}
+                className={ICON_BTN}
                 onClick={() => setShowSavedStems((v) => !v)}
                 aria-expanded={showSavedStems}
-                title="Load stems you've already separated in the cloud (no re-processing)"
+                aria-label="Saved stems"
+                title="Saved stems: load stems you've already separated in the cloud (no re-processing)"
               >
                 <FolderOpen size={16} />
-                <span>Saved stems</span>
               </button>
               {showSavedStems && (
                 <SavedStemsMenu
@@ -1018,22 +1148,12 @@ export default function LyricBloom() {
               )}
             </div>
           )}
-          <button
-            className={`${BTN_BASE} border-none bg-gradient-to-br from-[#E14F84] to-[#F2A93B]`}
-            onClick={togglePlay}
-            disabled={!audioURL}
-            title="Play/pause (Space)"
-          >
-            {isPlaying ? <Pause size={16} /> : <Play size={16} />}
-            <span>{isPlaying ? 'Pause' : 'Play'}</span>
-          </button>
-          <span ref={timeDisplayRef} className="text-[13px] text-text-dim min-w-[92px]">0:00 / 0:00</span>
-          <label
-            className={`${BTN_BASE} bg-panel-2 hover:bg-[#2E2136]`}
-            title="Replace the falling particles with an uploaded 3D model"
-          >
+
+          <ToolbarDivider />
+
+          <label className={BTN} title={glbName ? `Particle shape: ${glbName} · click to replace` : 'Replace the falling particles with an uploaded 3D model (.glb)'}>
             <Box size={16} />
-            <span>{glbName || 'Upload particle shape (.glb)'}</span>
+            <span className="max-w-[140px] truncate">{glbName || 'Shape'}</span>
             <input
               type="file"
               accept=".glb,.gltf,model/gltf-binary"
@@ -1042,306 +1162,45 @@ export default function LyricBloom() {
             />
           </label>
           {glbName && (
-            <button
-              className={`${BTN_BASE} bg-panel-2 hover:bg-[#2E2136]`}
-              onClick={handleResetParticles}
-              title="Reset to default particles"
-            >
+            <button className={ICON_BTN} onClick={handleResetParticles} aria-label="Reset particles" title="Reset to default particles">
               <RotateCcw size={16} />
             </button>
           )}
           <button
-            className={`${BTN_BASE} bg-panel-2 hover:bg-[#2E2136]`}
+            className={ICON_BTN}
             onClick={openStagePopout}
-            title="Open the visualizer in its own window, synced to this one"
+            aria-label="Pop out visualizer"
+            title="Pop out: open the visualizer in its own window, synced to this one"
           >
             <ExternalLink size={16} />
-            <span>Pop out</span>
           </button>
-          <div className="relative">
-            <button
-              className={`${BTN_BASE} bg-panel-2 hover:bg-[#2E2136]`}
-              onClick={() => setShowSettings((v) => !v)}
-              title="Adjust palette, stage colors, and lyric font"
-              aria-expanded={showSettings}
-            >
-              <Settings size={16} />
-              <span>Settings</span>
-            </button>
-            {showSettings && (
-              <>
-                <div className="fixed inset-0 z-40" onClick={() => setShowSettings(false)} />
-                <div className="absolute right-0 top-full mt-2 z-50 w-72 bg-panel border border-white/10 rounded-xl p-4 shadow-[0_8px_30px_rgba(0,0,0,0.5)] flex flex-col gap-4 text-left">
-                  {selectedBlock && (
-                    <div className="border border-white/10 rounded-lg p-3 bg-panel-2/40">
-                      <div className="flex items-center justify-between mb-3">
-                        <span
-                          className="text-[11px] font-semibold text-accent uppercase tracking-wide truncate max-w-[170px]"
-                          title={selectedBlock.text}
-                        >
-                          Chip: {selectedBlock.text}
-                        </span>
-                        <button
-                          className="text-[11px] text-text-dim hover:text-text hover:underline underline-offset-2 cursor-pointer"
-                          onClick={() => setSelectedBlockId(null)}
-                        >
-                          Done
-                        </button>
-                      </div>
+          <button
+            className={`${BTN} ${showGlbPanel ? '!bg-accent/20 !border-accent/60' : ''}`}
+            onClick={() => setShowGlbPanel((v) => !v)}
+            title="Stage themes, particle motion and what it reacts to"
+            aria-expanded={showGlbPanel}
+          >
+            <Sparkles size={16} />
+            <span>GLB</span>
+          </button>
+          <button
+            className={`${BTN} ${showSettings ? '!bg-accent/20 !border-accent/60' : ''}`}
+            onClick={() => setShowSettings((v) => !v)}
+            title="Palette, stage colors, lyric font and effects"
+            aria-expanded={showSettings}
+          >
+            <Settings size={16} />
+            <span>Settings</span>
+          </button>
 
-                      <div className="mb-3">
-                        <div className="flex items-center justify-between mb-1.5">
-                          <span className="text-[11px] text-text-dim">Text color</span>
-                          <button
-                            className="text-[11px] text-text-dim hover:text-text hover:underline underline-offset-2 cursor-pointer"
-                            onClick={handleResetBlockTextColor}
-                          >
-                            Use global
-                          </button>
-                        </div>
-                        <input
-                          type="color"
-                          value={selectedBlock.textColor || lyricColor}
-                          onChange={(e) => handleBlockTextColorChange(e.target.value)}
-                          className="w-8 h-8 rounded-md border border-white/10 bg-transparent p-0 cursor-pointer"
-                        />
-                      </div>
+          <div className="flex-1" />
 
-                      <div className="mb-3">
-                        <div className="flex items-center justify-between mb-1.5">
-                          <span className="text-[11px] text-text-dim">Text effect</span>
-                          <button
-                            className="text-[11px] text-text-dim hover:text-text hover:underline underline-offset-2 cursor-pointer"
-                            onClick={handleResetBlockTextEffect}
-                          >
-                            Use global
-                          </button>
-                        </div>
-                        <select
-                          value={selectedBlock.textEffect || textEffect}
-                          onChange={(e) => handleBlockTextEffectChange(e.target.value)}
-                          className="w-full bg-panel-2 text-text border border-white/10 rounded-lg px-3 py-2 text-[13px] cursor-pointer focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent"
-                        >
-                          {TEXT_EFFECTS.map((effect) => (
-                            <option key={effect.id} value={effect.id}>{effect.label}</option>
-                          ))}
-                        </select>
-                      </div>
-
-                      <div>
-                        <div className="flex items-center justify-between mb-1.5">
-                          <span className="text-[11px] text-text-dim">Font</span>
-                          {selectedBlock.fontName && (
-                            <button
-                              className="text-[11px] text-text-dim hover:text-text hover:underline underline-offset-2 cursor-pointer"
-                              onClick={handleResetBlockFont}
-                            >
-                              Use global
-                            </button>
-                          )}
-                        </div>
-                        <label className={`${BTN_BASE} bg-panel-2 hover:bg-[#2E2136] w-full justify-center`}>
-                          <Type size={16} />
-                          <span className="truncate">{selectedBlock.fontName || 'Upload font for this chip'}</span>
-                          <input
-                            type="file"
-                            accept=".woff2,.woff,.ttf,.otf"
-                            onChange={handleBlockFontFile}
-                            className="hidden"
-                          />
-                        </label>
-                      </div>
-                    </div>
-                  )}
-
-                  <div>
-                    <div className="flex items-center justify-between mb-2">
-                      <span className="text-[11px] font-semibold text-text-dim uppercase tracking-wide">Palette</span>
-                      <button
-                        className="text-[11px] text-text-dim hover:text-text hover:underline underline-offset-2 cursor-pointer"
-                        onClick={handleResetPalette}
-                      >
-                        Reset
-                      </button>
-                    </div>
-                    <div className="flex flex-wrap gap-2">
-                      {palette.map((color, i) => (
-                        <input
-                          key={i}
-                          type="color"
-                          value={color}
-                          onChange={(e) => handlePaletteColorChange(i, e.target.value)}
-                          className="w-8 h-8 rounded-md border border-white/10 bg-transparent p-0 cursor-pointer"
-                          title={`Palette color ${i + 1}`}
-                        />
-                      ))}
-                    </div>
-                  </div>
-
-                  <div>
-                    <div className="flex items-center justify-between mb-2">
-                      <span className="text-[11px] font-semibold text-text-dim uppercase tracking-wide">Particle size</span>
-                      <button
-                        className="text-[11px] text-text-dim hover:text-text hover:underline underline-offset-2 cursor-pointer"
-                        onClick={handleResetParticleSize}
-                      >
-                        Reset
-                      </button>
-                    </div>
-                    <div className="flex items-center gap-3">
-                      <input
-                        type="range"
-                        min="0.1"
-                        max="1.2"
-                        step="0.05"
-                        value={particleSize}
-                        onChange={(e) => setParticleSize(Number(e.target.value))}
-                        className="flex-1 cursor-pointer accent-accent"
-                        title="Size of an uploaded .glb particle shape"
-                      />
-                      <span className="text-xs text-text-dim w-11 text-right tabular-nums">{particleSize.toFixed(2)}</span>
-                    </div>
-                  </div>
-
-                  <div>
-                    <div className="flex items-center justify-between mb-2">
-                      <span className="text-[11px] font-semibold text-text-dim uppercase tracking-wide">Stage colors</span>
-                      <button
-                        className="text-[11px] text-text-dim hover:text-text hover:underline underline-offset-2 cursor-pointer"
-                        onClick={handleResetStageColors}
-                      >
-                        Reset
-                      </button>
-                    </div>
-                    <div className="flex items-center gap-4">
-                      <label className="flex items-center gap-2 text-xs cursor-pointer">
-                        <input
-                          type="color"
-                          value={stageColors.inner}
-                          onChange={(e) => handleStageColorChange('inner', e.target.value)}
-                          className="w-8 h-8 rounded-md border border-white/10 bg-transparent p-0 cursor-pointer"
-                        />
-                        Inner
-                      </label>
-                      <label className="flex items-center gap-2 text-xs cursor-pointer">
-                        <input
-                          type="color"
-                          value={stageColors.outer}
-                          onChange={(e) => handleStageColorChange('outer', e.target.value)}
-                          className="w-8 h-8 rounded-md border border-white/10 bg-transparent p-0 cursor-pointer"
-                        />
-                        Outer
-                      </label>
-                    </div>
-                  </div>
-
-                  <div>
-                    <div className="flex items-center justify-between mb-2">
-                      <span className="text-[11px] font-semibold text-text-dim uppercase tracking-wide">Font color</span>
-                      <button
-                        className="text-[11px] text-text-dim hover:text-text hover:underline underline-offset-2 cursor-pointer"
-                        onClick={handleResetLyricColor}
-                      >
-                        Reset
-                      </button>
-                    </div>
-                    <label className="flex items-center gap-2 text-xs cursor-pointer">
-                      <input
-                        type="color"
-                        value={lyricColor}
-                        onChange={(e) => setLyricColor(e.target.value)}
-                        className="w-8 h-8 rounded-md border border-white/10 bg-transparent p-0 cursor-pointer"
-                      />
-                      Active lyric text
-                    </label>
-                  </div>
-
-                  <div>
-                    <div className="flex items-center justify-between mb-2">
-                      <span className="text-[11px] font-semibold text-text-dim uppercase tracking-wide">Font size</span>
-                      <button
-                        className="text-[11px] text-text-dim hover:text-text hover:underline underline-offset-2 cursor-pointer"
-                        onClick={handleResetLyricSize}
-                      >
-                        Reset
-                      </button>
-                    </div>
-                    <div className="flex items-center gap-3">
-                      <input
-                        type="range"
-                        min="16"
-                        max="200"
-                        step="1"
-                        value={lyricSize}
-                        onChange={(e) => setLyricSize(Number(e.target.value))}
-                        className="flex-1 cursor-pointer accent-accent"
-                      />
-                      <span className="text-xs text-text-dim w-11 text-right tabular-nums">{lyricSize}px</span>
-                    </div>
-                  </div>
-
-                  <div>
-                    <div className="flex items-center justify-between mb-2">
-                      <span className="text-[11px] font-semibold text-text-dim uppercase tracking-wide">Text effect</span>
-                      <button
-                        className="text-[11px] text-text-dim hover:text-text hover:underline underline-offset-2 cursor-pointer"
-                        onClick={handleResetTextEffect}
-                      >
-                        Reset
-                      </button>
-                    </div>
-                    <select
-                      value={textEffect}
-                      onChange={(e) => setTextEffect(e.target.value)}
-                      className="w-full bg-panel-2 text-text border border-white/10 rounded-lg px-3 py-2 text-[13px] cursor-pointer focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent"
-                      title="WebGL shader applied to the active lyric text on Stage"
-                    >
-                      {TEXT_EFFECTS.map((effect) => (
-                        <option key={effect.id} value={effect.id}>{effect.label}</option>
-                      ))}
-                    </select>
-                  </div>
-
-                  <div>
-                    <span className="text-[11px] font-semibold text-text-dim uppercase tracking-wide block mb-2">
-                      Lyric font
-                    </span>
-                    <div className="flex items-center gap-2 flex-wrap">
-                      <label
-                        className={`${BTN_BASE} bg-panel-2 hover:bg-[#2E2136]`}
-                        title="Use an uploaded font for the lyric text"
-                      >
-                        <Type size={16} />
-                        <span>{fontName || 'Upload font'}</span>
-                        <input
-                          type="file"
-                          accept=".woff2,.woff,.ttf,.otf"
-                          onChange={handleFontFile}
-                          className="hidden"
-                        />
-                      </label>
-                      {fontName && (
-                        <button
-                          className={`${BTN_BASE} bg-panel-2 hover:bg-[#2E2136]`}
-                          onClick={handleResetFont}
-                          title="Reset to default font"
-                        >
-                          <RotateCcw size={16} />
-                        </button>
-                      )}
-                    </div>
-                    {fontError && <div className="text-xs text-[#E14F84] mt-1.5">{fontError}</div>}
-                  </div>
-                </div>
-              </>
-            )}
-          </div>
           {authReady && (user ? (
             <div className="flex items-center gap-2">
               <select
                 value={mixId ?? ''}
                 onChange={(e) => selectMix(e.target.value)}
-                className={`${FIELD_BASE} max-w-[200px] cursor-pointer`}
+                className={`${FIELD_BASE} h-9 py-0 max-w-[200px] cursor-pointer`}
                 title="Your saved mixes"
               >
                 {!mixId && <option value="">Loading mixes…</option>}
@@ -1349,39 +1208,36 @@ export default function LyricBloom() {
                   <option key={m.id} value={m.id}>{m.title}</option>
                 ))}
               </select>
-              <button
-                className={`${BTN_BASE} bg-panel-2 hover:bg-[#2E2136]`}
-                onClick={newMix}
-                title="Start a new blank mix"
-              >
+              <button className={ICON_BTN} onClick={newMix} aria-label="New mix" title="Start a new blank mix">
                 <FilePlus size={16} />
               </button>
-              <span className="text-text-dim" title={SAVE_STATUS_TEXT[saveStatus]}>
+              <span className="text-text-dim px-1" title={SAVE_STATUS_TEXT[saveStatus]} aria-label={SAVE_STATUS_TEXT[saveStatus]}>
                 {saveStatus === 'error' ? <CloudOff size={16} className="text-[#E14F84]" /> : <Cloud size={16} className={saveStatus === 'saving' ? 'animate-pulse' : ''} />}
               </span>
               <button
-                className={`${BTN_BASE} bg-panel-2 hover:bg-[#2E2136]`}
+                className={`${BTN} px-2`}
                 onClick={signOutUser}
+                aria-label="Sign out"
                 title={`Signed in as ${user.email}. Click to sign out.`}
               >
                 {user.photoURL && (
-                  <img src={user.photoURL} alt="" referrerPolicy="no-referrer" className="w-4 h-4 rounded-full" />
+                  <img src={user.photoURL} alt="" referrerPolicy="no-referrer" className="w-5 h-5 rounded-full" />
                 )}
                 <LogOut size={16} />
               </button>
             </div>
           ) : (
-            <button className={`${BTN_BASE} bg-panel-2 hover:bg-[#2E2136]`} onClick={handleSignIn}>
+            <button className={BTN} onClick={handleSignIn}>
               <LogIn size={16} />
-              <span>Sign in with Google</span>
+              <span>Sign in</span>
             </button>
           ))}
         </div>
-        {glbError && <div className="w-full text-xs text-[#E14F84] mt-1.5">{glbError}</div>}
-        {authError && <div className="w-full text-xs text-[#E14F84] mt-1.5">{authError}</div>}
-        {stemsError && <div className="w-full text-xs text-[#E14F84] mt-1.5">{stemsError}</div>}
+        {glbError && <div className="text-xs text-[#E14F84]">{glbError}</div>}
+        {authError && <div className="text-xs text-[#E14F84]">{authError}</div>}
+        {stemsError && <div className="text-xs text-[#E14F84]">{stemsError}</div>}
         {separation.job && <SeparationStatus job={separation.job} onDismiss={separation.dismiss} />}
-        {stemsLoading && <div className="w-full text-xs text-text-dim mt-1.5">Loading saved stems for {stemsLoading}…</div>}
+        {stemsLoading && <div className="text-xs text-text-dim">Loading saved stems for {stemsLoading}…</div>}
       </header>
 
       {stems && (
@@ -1400,7 +1256,7 @@ export default function LyricBloom() {
 
       <Stage
         audioTimeRef={audioTimeRef}
-        bassRef={bassRef}
+        audioLevelsRef={audioLevelsRef}
         placedBlocksRef={placedBlocksRef}
         placedBlocks={placedBlocks}
         particleShapeBuffer={glbBuffer}
@@ -1412,55 +1268,74 @@ export default function LyricBloom() {
         textSize={lyricSize}
         particleSize={particleSize}
         textEffect={textEffect}
+        glbSettings={glbSettings}
       />
 
-      <LyricFinder
-        user={user}
-        audioDuration={audioURL ? audioDuration : null}
-        inputClassName={FIELD_BASE}
-        buttonClassName={`${BTN_BASE} bg-panel-2 hover:bg-[#2E2136]`}
-        onFound={handleLyricsFound}
-      />
-
-      <div className="flex gap-2.5 items-start">
-        <textarea
-          className="flex-1 bg-panel text-text border border-white/10 rounded-lg px-3 py-2.5 font-mono text-[13px] resize-y focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent"
-          placeholder="Paste lyrics here, one line per row... (Ctrl/Cmd+Enter to add)"
-          value={lyricInput}
-          onChange={(e) => setLyricInput(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) handleAddLyrics();
-          }}
-          rows={2}
+      <section className="bg-panel/60 border border-white/5 rounded-xl p-3 flex flex-col gap-3">
+        <LyricFinder
+          user={user}
+          audioDuration={audioURL ? audioDuration : null}
+          inputClassName={FIELD_BASE}
+          buttonClassName={BTN}
+          onFound={handleLyricsFound}
         />
-        <button className={`${BTN_BASE} bg-panel-2 hover:bg-[#2E2136]`} onClick={handleAddLyrics}>
-          <Plus size={16} /> Add to bank
-        </button>
-      </div>
 
-      <div className="flex gap-2 flex-wrap min-h-[20px] px-0.5 py-1">
-        {lyricBank.length === 0 && (
-          <span className="text-xs text-text-dim py-1.5">
-            Add lyrics above, then drag each line onto the timeline below.
-          </span>
-        )}
-        {lyricBank.map((item) => (
-          <div
-            key={item.id}
-            className="flex items-center gap-1.5 bg-panel-2 border border-white/10 rounded-full px-3.5 py-1.5 text-xs cursor-grab select-none active:cursor-grabbing"
-            style={fontLoaded ? { fontFamily: CUSTOM_FONT_FAMILY } : undefined}
-            draggable
-            onDragStart={(e) => handleDragStart(e, item)}
-          >
-            <span>{item.text}</span>
-            <button onClick={(e)=> {e.stopPropagation(); handleRemoveFromBank(item.id);}}>
-              <X size = {12} />
+        <div className="flex gap-2.5 items-start">
+          <textarea
+            className={`${FIELD_BASE} flex-1 py-2.5 resize-y`}
+            placeholder="Paste lyrics here, one line per row… (Ctrl/Cmd+Enter to add)"
+            value={lyricInput}
+            onChange={(e) => setLyricInput(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) handleAddLyrics();
+            }}
+            rows={2}
+          />
+          <button className={BTN} onClick={handleAddLyrics} disabled={!lyricInput.trim()}>
+            <Plus size={16} />
+            <span>Add to bank</span>
+          </button>
+        </div>
+
+        <div className="flex gap-2 flex-wrap min-h-[20px]">
+          {lyricBank.length === 0 && (
+            <span className="text-xs text-text-dim py-1.5">
+              Add lyrics above, then drag each line onto the timeline below.
+            </span>
+          )}
+          {lyricBank.length > 0 && (
+            <button
+              className="inline-flex items-center gap-1.5 rounded-full px-3 py-1 text-xs text-text-dim border border-white/10 hover:text-[#E14F84] hover:border-[#E14F84]/50 hover:bg-[#E14F84]/10 cursor-pointer"
+              onClick={handleClearBank}
+              title="Remove every line from the lyric bank"
+            >
+              <Trash2 size={12} />
+              Clear all
             </button>
-          </div>
-        ))}
-      </div>
+          )}
+          {lyricBank.map((item) => (
+            <div
+              key={item.id}
+              className="flex items-center gap-1.5 bg-white/5 border border-white/10 rounded-full pl-3.5 pr-1.5 py-1 text-xs cursor-grab select-none hover:bg-white/10 active:cursor-grabbing"
+              style={fontLoaded ? { fontFamily: CUSTOM_FONT_FAMILY } : undefined}
+              draggable
+              onDragStart={(e) => handleDragStart(e, item)}
+            >
+              <span>{item.text}</span>
+              <button
+                className="p-0.5 rounded-full text-text-dim hover:text-text hover:bg-white/10 cursor-pointer"
+                onClick={(e) => { e.stopPropagation(); handleRemoveFromBank(item.id); }}
+                aria-label={`Remove "${item.text}"`}
+                title="Remove from bank"
+              >
+                <X size={12} />
+              </button>
+            </div>
+          ))}
+        </div>
+      </section>
 
-      <div className="bg-panel rounded-xl p-3 overflow-x-auto">
+      <div ref={timelineScrollRef} className="relative bg-panel rounded-xl p-3 overflow-x-auto">
         <div
           className={`relative h-5 mb-1 select-none ${audioURL ? 'cursor-pointer' : ''}`}
           style={{ width: `${timeToX(audioDuration)}px` }}
@@ -1506,12 +1381,263 @@ export default function LyricBloom() {
             </div>
           ))}
         </div>
-        <div className="text-[11px] text-text-dim mt-2">
+        <div className="text-[11px] text-text-dim mt-2 sticky left-0">
           {allSelected
-            ? 'All blocks selected: drag any block to move them together · Esc or click the empty track to deselect'
+            ? 'All blocks selected: drag any block to move them together · D to send them all back to the bank · Esc or click the empty track to deselect'
             : 'Drag a chip onto the track · drag a placed block to move it · drag its right edge to resize · double-click to send it back to the bank · press S to select all'}
         </div>
       </div>
+
+      {showGlbPanel && (
+        <FloatingPanel
+          title="GLB settings"
+          icon={<Sparkles size={14} className="text-text-dim" />}
+          onClose={() => setShowGlbPanel(false)}
+          storageKey="lyric-bloom:glb-panel"
+        >
+          <SettingSection label="Stage theme">
+            <select
+              value={activeTheme?.id ?? 'custom'}
+              onChange={(e) => applyStageTheme(e.target.value)}
+              className={`${FIELD_BASE} w-full cursor-pointer`}
+              title="Sets the palette, stage colors and motion together"
+            >
+              {!activeTheme && <option value="custom">Custom</option>}
+              {STAGE_THEMES.map((theme) => (
+                <option key={theme.id} value={theme.id}>{theme.label}</option>
+              ))}
+            </select>
+            <div className="flex gap-1 mt-2" aria-hidden="true">
+              {palette.map((color, i) => (
+                <span key={i} className="h-2 flex-1 rounded-full" style={{ background: color }} />
+              ))}
+            </div>
+          </SettingSection>
+
+          <SettingSection label="Motion" onReset={() => updateGlbSetting('motion', DEFAULT_GLB_SETTINGS.motion)}>
+            <div className="grid grid-cols-3 gap-1.5" role="radiogroup" aria-label="Motion">
+              {MOTION_MODES.map((mode) => (
+                <button
+                  key={mode.id}
+                  role="radio"
+                  aria-checked={glbSettings.motion === mode.id}
+                  onClick={() => updateGlbSetting('motion', mode.id)}
+                  className={`h-8 rounded-md border text-[12px] cursor-pointer transition-colors ${
+                    glbSettings.motion === mode.id
+                      ? 'bg-accent/20 border-accent/60 text-text'
+                      : 'bg-white/5 border-white/10 text-text-dim hover:text-text hover:bg-white/10'
+                  }`}
+                >
+                  {mode.label}
+                </button>
+              ))}
+            </div>
+            <div className="text-[11px] text-text-dim mt-1.5">
+              {MOTION_MODES.find((m) => m.id === glbSettings.motion)?.hint}
+            </div>
+          </SettingSection>
+
+          <SettingSection label="Reacts to" onReset={() => updateGlbSetting('reactTo', DEFAULT_GLB_SETTINGS.reactTo)}>
+            <select
+              value={glbSettings.reactTo}
+              onChange={(e) => updateGlbSetting('reactTo', e.target.value)}
+              className={`${FIELD_BASE} w-full cursor-pointer`}
+            >
+              {REACT_SOURCES.map((source) => (
+                <option key={source.id} value={source.id}>
+                  {source.label}{source.needsStems && !stems ? ' (needs stems)' : ''}
+                </option>
+              ))}
+            </select>
+            {REACT_SOURCES.find((src) => src.id === glbSettings.reactTo)?.needsStems && !stems && (
+              <div className="text-[11px] text-text-dim mt-1.5">
+                No stems loaded, so this follows the {REACT_SOURCES.find((src) => src.id === glbSettings.reactTo).fallback === 'mids' ? 'mids' : 'overall level'} for now. Load stems or Split vocals to react to the stem itself.
+              </div>
+            )}
+          </SettingSection>
+
+          <GlbSlider label="Sensitivity" value={glbSettings.sensitivity} min={0} max={3} onChange={(v) => updateGlbSetting('sensitivity', v)}
+            title="How strongly the particles respond to the signal" />
+          <GlbSlider label="Speed" value={glbSettings.speed} min={0} max={3} onChange={(v) => updateGlbSetting('speed', v)}
+            title="Base fall, breathing or spin speed" />
+          <GlbSlider label="Pulse" value={glbSettings.pulse} min={0} max={3} onChange={(v) => updateGlbSetting('pulse', v)}
+            title="How much particles swell with the signal" />
+          <GlbSlider label="Tumble" value={glbSettings.spin} min={0} max={4} onChange={(v) => updateGlbSetting('spin', v)}
+            title="How fast each .glb shape spins on its own axis" />
+
+          <SettingSection label="Particle size" onReset={handleResetParticleSize}>
+            <div className="flex items-center gap-3">
+              <input
+                type="range"
+                min="0.1"
+                max="1.2"
+                step="0.05"
+                value={particleSize}
+                onChange={(e) => setParticleSize(Number(e.target.value))}
+                className="flex-1 cursor-pointer accent-accent"
+                title="Size of an uploaded .glb particle shape"
+              />
+              <span className="text-xs text-text-dim w-11 text-right tabular-nums">{particleSize.toFixed(2)}</span>
+            </div>
+          </SettingSection>
+
+        </FloatingPanel>
+      )}
+
+      {showSettings && (
+        <FloatingPanel
+          title="Settings"
+          icon={<Settings size={14} className="text-text-dim" />}
+          onClose={() => setShowSettings(false)}
+          storageKey="lyric-bloom:settings-panel"
+        >
+          {selectedBlock && (
+            <div className="border border-accent/30 rounded-lg p-3 bg-white/[0.03] flex flex-col gap-3">
+              <div className="flex items-center justify-between gap-2">
+                <span
+                  className="text-[11px] font-semibold text-accent uppercase tracking-wide truncate"
+                  title={selectedBlock.text}
+                >
+                  Chip: {selectedBlock.text}
+                </span>
+                <button
+                  className="inline-flex items-center gap-1 text-[11px] text-text-dim hover:text-text rounded-md px-1.5 py-0.5 hover:bg-white/10 cursor-pointer"
+                  onClick={() => setSelectedBlockId(null)}
+                >
+                  <Check size={12} />
+                  Done
+                </button>
+              </div>
+
+              <SettingSection label="Text color" onReset={handleResetBlockTextColor} resetLabel="Use global">
+                <input
+                  type="color"
+                  value={selectedBlock.textColor || lyricColor}
+                  onChange={(e) => handleBlockTextColorChange(e.target.value)}
+                  className={SWATCH}
+                />
+              </SettingSection>
+
+              <SettingSection label="Text effect" onReset={handleResetBlockTextEffect} resetLabel="Use global">
+                <select
+                  value={selectedBlock.textEffect || textEffect}
+                  onChange={(e) => handleBlockTextEffectChange(e.target.value)}
+                  className={`${FIELD_BASE} w-full cursor-pointer`}
+                >
+                  {TEXT_EFFECTS.map((effect) => (
+                    <option key={effect.id} value={effect.id}>{effect.label}</option>
+                  ))}
+                </select>
+              </SettingSection>
+
+              <SettingSection label="Font" onReset={selectedBlock.fontName ? handleResetBlockFont : null} resetLabel="Use global">
+                <label className={`${BTN} w-full`}>
+                  <Type size={16} />
+                  <span className="truncate">{selectedBlock.fontName || 'Upload font for this chip'}</span>
+                  <input
+                    type="file"
+                    accept=".woff2,.woff,.ttf,.otf"
+                    onChange={handleBlockFontFile}
+                    className="hidden"
+                  />
+                </label>
+              </SettingSection>
+            </div>
+          )}
+
+          <SettingSection label="Palette" onReset={handleResetPalette}>
+            <div className="flex flex-wrap gap-2">
+              {palette.map((color, i) => (
+                <input
+                  key={i}
+                  type="color"
+                  value={color}
+                  onChange={(e) => handlePaletteColorChange(i, e.target.value)}
+                  className={SWATCH}
+                  title={`Palette color ${i + 1}`}
+                />
+              ))}
+            </div>
+          </SettingSection>
+
+          <SettingSection label="Stage colors" onReset={handleResetStageColors}>
+            <div className="flex items-center gap-4">
+              <label className="flex items-center gap-2 text-xs cursor-pointer">
+                <input
+                  type="color"
+                  value={stageColors.inner}
+                  onChange={(e) => handleStageColorChange('inner', e.target.value)}
+                  className={SWATCH}
+                />
+                Inner
+              </label>
+              <label className="flex items-center gap-2 text-xs cursor-pointer">
+                <input
+                  type="color"
+                  value={stageColors.outer}
+                  onChange={(e) => handleStageColorChange('outer', e.target.value)}
+                  className={SWATCH}
+                />
+                Outer
+              </label>
+            </div>
+          </SettingSection>
+
+          <SettingSection label="Font color" onReset={handleResetLyricColor}>
+            <label className="flex items-center gap-2 text-xs cursor-pointer">
+              <input
+                type="color"
+                value={lyricColor}
+                onChange={(e) => setLyricColor(e.target.value)}
+                className={SWATCH}
+              />
+              Active lyric text
+            </label>
+          </SettingSection>
+
+          <SettingSection label="Font size" onReset={handleResetLyricSize}>
+            <div className="flex items-center gap-3">
+              <input
+                type="range"
+                min="16"
+                max="200"
+                step="1"
+                value={lyricSize}
+                onChange={(e) => setLyricSize(Number(e.target.value))}
+                className="flex-1 cursor-pointer accent-accent"
+              />
+              <span className="text-xs text-text-dim w-11 text-right tabular-nums">{lyricSize}px</span>
+            </div>
+          </SettingSection>
+
+          <SettingSection label="Text effect" onReset={handleResetTextEffect}>
+            <select
+              value={textEffect}
+              onChange={(e) => setTextEffect(e.target.value)}
+              className={`${FIELD_BASE} w-full cursor-pointer`}
+              title="WebGL shader applied to the active lyric text on Stage"
+            >
+              {TEXT_EFFECTS.map((effect) => (
+                <option key={effect.id} value={effect.id}>{effect.label}</option>
+              ))}
+            </select>
+          </SettingSection>
+
+          <SettingSection label="Lyric font" onReset={fontName ? handleResetFont : null} resetLabel="Reset to default font">
+            <label className={`${BTN} w-full`} title="Use an uploaded font for the lyric text">
+              <Type size={16} />
+              <span className="truncate">{fontName || 'Upload font'}</span>
+              <input
+                type="file"
+                accept=".woff2,.woff,.ttf,.otf"
+                onChange={handleFontFile}
+                className="hidden"
+              />
+            </label>
+            {fontError && <div className="text-xs text-[#E14F84] mt-1.5">{fontError}</div>}
+          </SettingSection>
+        </FloatingPanel>
+      )}
 
       <audio
         ref={audioRef}
@@ -1525,6 +1651,55 @@ export default function LyricBloom() {
       />
       <audio ref={vocalsAudioRef} src={stems?.vocalsURL || undefined} preload="auto" className="hidden" />
     </div>
+  );
+}
+
+// A labelled 0..max slider row in the GLB settings panel, shown as a ×multiplier.
+function GlbSlider({ label, value, min, max, onChange, title }) {
+  return (
+    <SettingSection label={label} onReset={value === 1 ? null : () => onChange(1)}>
+      <div className="flex items-center gap-3">
+        <input
+          type="range"
+          min={min}
+          max={max}
+          step="0.05"
+          value={value}
+          onChange={(e) => onChange(Number(e.target.value))}
+          className="flex-1 cursor-pointer accent-accent"
+          title={title}
+          aria-label={label}
+        />
+        <span className="text-xs text-text-dim w-11 text-right tabular-nums">×{value.toFixed(2)}</span>
+      </div>
+    </SettingSection>
+  );
+}
+
+function ToolbarDivider() {
+  return <div className="w-px h-6 bg-white/10 mx-1" aria-hidden="true" />;
+}
+
+// A labelled block in the settings panel, with an optional icon button that
+// resets it (hidden when onReset is null).
+function SettingSection({ label, onReset, resetLabel = 'Reset', children }) {
+  return (
+    <section>
+      <div className="flex items-center justify-between mb-2 min-h-6">
+        <span className="text-[11px] font-semibold text-text-dim uppercase tracking-wide">{label}</span>
+        {onReset && (
+          <button
+            className="p-1 rounded-md text-text-dim hover:text-text hover:bg-white/10 cursor-pointer"
+            onClick={onReset}
+            aria-label={`${resetLabel}: ${label}`}
+            title={resetLabel}
+          >
+            <RotateCcw size={13} />
+          </button>
+        )}
+      </div>
+      {children}
+    </section>
   );
 }
 
@@ -1548,7 +1723,7 @@ function SeparationStatus({ job, onDismiss }) {
   const showBar = job.phase === 'uploading' || job.phase === 'running';
 
   return (
-    <div className="w-full flex items-center gap-3 mt-1.5 text-xs">
+    <div className="flex items-center gap-3 text-xs">
       <span className={job.phase === 'error' ? 'text-[#E14F84]' : 'text-text-dim'}>{text}</span>
       {showBar && (
         <div className="h-1 w-40 rounded-full bg-white/10 overflow-hidden">
@@ -1580,7 +1755,7 @@ function SavedStemsMenu({ uid, currentId, onPick, onClose }) {
   return (
     <>
       <div className="fixed inset-0 z-40" onClick={onClose} />
-      <div className="absolute right-0 top-full mt-2 z-50 w-80 max-h-80 overflow-y-auto bg-panel border border-white/10 rounded-xl p-2 shadow-[0_8px_30px_rgba(0,0,0,0.5)] text-left">
+      <div className="absolute left-0 top-full mt-2 z-50 w-80 max-h-80 overflow-y-auto bg-panel border border-white/10 rounded-xl p-2 shadow-[0_8px_30px_rgba(0,0,0,0.5)] text-left">
         {error && <div className="text-xs text-[#E14F84] p-2">{error}</div>}
         {!error && items === null && <div className="text-xs text-text-dim p-2">Loading…</div>}
         {!error && items?.length === 0 && (

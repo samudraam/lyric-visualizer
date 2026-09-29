@@ -5,7 +5,7 @@
 export const STAGE_CHANNEL_NAME = 'lyric-bloom-stage';
 
 // Message shapes posted over the channel:
-//   { type: 'sync', currentTime, duration, bass }  — editor → popout, every frame
+//   { type: 'sync', currentTime, duration, levels } — editor → popout, every frame (levels: see EMPTY_AUDIO_LEVELS in stageThemes.js)
 //   { type: 'lyrics', placedBlocks }                — editor → popout, on edit
 //   { type: 'shape', buffer }                       — editor → popout, on .glb upload/reset
 //   { type: 'font', buffer }                        — editor → popout, on font upload/reset
@@ -14,4 +14,5 @@ export const STAGE_CHANNEL_NAME = 'lyric-bloom-stage';
 //   { type: 'lyricColor', lyricColor }                — editor → popout, on settings-menu edit
 //   { type: 'lyricSize', lyricSize }                  — editor → popout, on settings-menu edit
 //   { type: 'particleSize', particleSize }             — editor → popout, on settings-menu edit
+//   { type: 'glbSettings', glbSettings }               — editor → popout, on GLB-settings edit
 //   { type: 'ready' }                                — popout → editor, once on mount

@@ -1,5 +1,5 @@
 @import "tailwindcss";
-@import url('https://fonts.googleapis.com/css2?family=Fraunces:wght@600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 
 @theme {
   --color-bg: #000000;
@@ -11,8 +11,8 @@
   --color-timeline: #808080;
   --color-timeline-active: #1e4630;
 
-  --font-display: 'Fraunces', serif;
-  --font-mono: 'JetBrains Mono', monospace;
+  --font-display: 'Inter', ui-sans-serif, system-ui, sans-serif;
+  --font-sans: 'Inter', ui-sans-serif, system-ui, sans-serif;
 
   --animate-fade-in-up: fadeInUp 0.5s ease forwards;
 }
@@ -32,5 +32,6 @@ body {
   margin: 0;
   background: var(--color-bg);
   color: var(--color-text);
-  font-family: var(--font-mono);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
 }
